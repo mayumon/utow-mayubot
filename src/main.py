@@ -300,14 +300,18 @@ tournament = app_commands.Group(name="tournament", description="tournament utili
 
 
 # /tournament swiss_refresh
-@tournament.command(name="swiss_refresh", description="Generate next Swiss round from latest fully reported results.")
+@tournament.command(
+    name="swiss_refresh",
+    description="Fill the next Swiss round's placeholders based on current results (does not create matches)."
+)
 @app_commands.describe(slug="tournament slug")
-async def match_swiss_refresh(inter: discord.Interaction, slug: str):
+async def tournament_swiss_refresh(inter: discord.Interaction, slug: str):
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms", ephemeral=True)
     if not get_settings(slug):
         return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first", ephemeral=True)
 
+    # latest fully reported round
     latest = get_latest_fully_reported_round(slug)
     if not latest:
         return await inter.response.send_message(
@@ -316,28 +320,48 @@ async def match_swiss_refresh(inter: discord.Interaction, slug: str):
         )
 
     next_round = latest + 1
-    deleted = delete_unreported_round(slug, next_round)
+    # next round must already exist (placeholders created earlier via /match add)
+    if not round_exists(slug, next_round):
+        return await inter.response.send_message(
+            f"round {next_round} does not exist yet. create placeholders first: `/match add slug:{slug} kind:swiss rounds:1`",
+            ephemeral=True
+        )
+    if not round_has_placeholders(slug, next_round):
+        return await inter.response.send_message(
+            f"round {next_round} has no empty placeholders to fill (maybe already assigned?).",
+            ephemeral=True
+        )
 
     prev_ms = list_round_matches(slug, latest)
-    team_ids = []
+    team_ids: list[int] = []
     for m in prev_ms:
         for t in (m["team_a_role_id"], m["team_b_role_id"]):
             if t and t not in team_ids:
                 team_ids.append(t)
 
     hist = swiss_history(slug)
-    pairs = pair_next_round(team_ids, hist)
+    pairs = pair_next_round(team_ids, hist)  # returns list[(a,b)]
 
-    pairings = [{"match_id": None, "team_a_role_id": a, "team_b_role_id": b, "start_time_local": None}
-                for (a, b) in pairs]
-    assigned = create_swiss_round(slug, next_round, pairings)
+    placeholders = list_round_placeholders(slug, next_round)
+    if len(pairs) != len(placeholders):
+        return await inter.response.send_message(
+            f"cannot fill round {next_round}: {len(placeholders)} placeholders vs {len(pairs)} computed pairs.",
+            ephemeral=True
+        )
+
+    try:
+        assign_pairs_into_round(slug, next_round, pairs)
+    except ValueError as e:
+        return await inter.response.send_message(str(e), ephemeral=True)
+
+    lines = []
+    for mid, (a, b) in zip(placeholders, pairs):
+        lines.append(f"• <@&{a}> vs <@&{b}>  (#{mid})")
+
     await inter.response.send_message(
         embed=discord.Embed(
-            title=f"Swiss Round {next_round} created — {slug}",
-            description=f"(deleted {deleted} unreported match(es))\n" +
-                        "\n".join(
-                            f"• <@&{pairings[i]['team_a_role_id']}> vs <@&{pairings[i]['team_b_role_id']}>  (#{assigned[i]})"
-                            for i in range(len(pairings))),
+            title=f"Swiss Round {next_round} filled — {slug}",
+            description="\n".join(lines),
             color=0xB54882
         ),
         ephemeral=True

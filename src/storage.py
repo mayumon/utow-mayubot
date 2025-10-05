@@ -455,3 +455,51 @@ def _next_match_id_in_tx(cur, tournament_name: str) -> int:
     cur.execute("SELECT COALESCE(MAX(match_id), 0) AS n FROM matches WHERE tournament_name=?", (tournament_name,))
     row = cur.fetchone()
     return int(row["n"]) + 1
+
+
+def round_has_placeholders(slug: str, round_no: int) -> bool:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT 1
+            FROM matches
+            WHERE tournament_name=? AND phase='swiss' AND round_no=?
+              AND team_a_role_id IS NULL AND team_b_role_id IS NULL
+            LIMIT 1
+        """, (slug, round_no))
+        return cur.fetchone() is not None
+
+
+def list_round_placeholders(slug: str, round_no: int) -> list[int]:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT match_id
+            FROM matches
+            WHERE tournament_name=? AND phase='swiss' AND round_no=?
+              AND team_a_role_id IS NULL AND team_b_role_id IS NULL
+            ORDER BY match_id
+        """, (slug, round_no))
+        return [int(r["match_id"]) for r in cur.fetchall()]
+
+
+def assign_pairs_into_round(slug: str, round_no: int, pairs: list[tuple[int, int]]) -> None:
+
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT match_id
+            FROM matches
+            WHERE tournament_name=? AND phase='swiss' AND round_no=?
+              AND team_a_role_id IS NULL AND team_b_role_id IS NULL
+            ORDER BY match_id
+        """, (slug, round_no))
+        mids = [int(r["match_id"]) for r in cur.fetchall()]
+        if len(mids) != len(pairs):
+            raise ValueError(f"pair-count {len(pairs)} != placeholders {len(mids)} in round {round_no}")
+        for mid, (a, b) in zip(mids, pairs):
+            cur.execute("""
+                UPDATE matches
+                SET team_a_role_id=?, team_b_role_id=?
+                WHERE tournament_name=? AND match_id=? AND phase='swiss' AND round_no=?
+            """, (a, b, slug, mid, round_no))
