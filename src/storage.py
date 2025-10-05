@@ -503,3 +503,38 @@ def assign_pairs_into_round(slug: str, round_no: int, pairs: list[tuple[int, int
                 SET team_a_role_id=?, team_b_role_id=?
                 WHERE tournament_name=? AND match_id=? AND phase='swiss' AND round_no=?
             """, (a, b, slug, mid, round_no))
+
+
+def get_team_display_map(slug: str) -> dict[int, str]:
+    """role_id -> display label (display_name if present, else @role mention placeholder)."""
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT team_role_id, COALESCE(NULLIF(TRIM(display_name), ''), NULL) AS dn
+            FROM teams
+            WHERE tournament_name=?
+        """, (slug,))
+        out = {}
+        for r in cur.fetchall():
+            rid = int(r["team_role_id"])
+            dn = r["dn"]
+            out[rid] = dn if dn else f"<@&{rid}>"
+        return out
+
+
+def list_all_matches_full(slug: str) -> list[dict]:
+    """All matches for a tournament with phase/round and core fields."""
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT match_id, phase, round_no, start_time_local,
+                   team_a_role_id, team_b_role_id,
+                   score_a, score_b, reported
+            FROM matches
+            WHERE tournament_name=?
+            ORDER BY
+              CASE phase WHEN 'swiss' THEN 1 WHEN 'playoff' THEN 2 ELSE 3 END,
+              COALESCE(round_no, 0),
+              match_id
+        """, (slug,))
+        return [dict(r) for r in cur.fetchall()]
