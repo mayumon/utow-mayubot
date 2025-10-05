@@ -4,6 +4,12 @@ from discord import app_commands
 from discord.ext import commands
 from .config import DISCORD_TOKEN
 from .storage import *
+from .swiss_helpers import *
+from collections import defaultdict
+import random
+from datetime import datetime
+from typing import Literal
+
 
 # initialize bot
 intents = discord.Intents.default()
@@ -43,7 +49,6 @@ setup = app_commands.Group(name="setup", description="configure tournaments")
 @setup.command(name="new", description="create or update a tournament slug")
 @app_commands.describe(slug="challonge tournament slug")
 async def setup_new(inter: discord.Interaction, slug: str):
-
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms", ephemeral=True)
 
@@ -54,8 +59,8 @@ async def setup_new(inter: discord.Interaction, slug: str):
 # /setup channels <announcements> <match-chats>
 @setup.command(name="channels", description="set announcement and match channels")
 @app_commands.describe(slug="tournament slug",
-                        announcements="announcements channel",
-                        match_chats="match-chats channel",)
+                       announcements="announcements channel",
+                       match_chats="match-chats channel", )
 async def setup_channels(inter: discord.Interaction,
                          slug: str,
                          announcements: discord.TextChannel,
@@ -63,15 +68,59 @@ async def setup_channels(inter: discord.Interaction,
 
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms", ephemeral=True)
+
     if not get_settings(slug):
         return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first", ephemeral=True)
+
     set_channels(slug, announcements.id, match_chats.id)
+
     await inter.response.send_message(
         f"saved channels {announcements.mention} (announcements) and {match_chats.mention} (match threads) for `{slug}` tournament",
         ephemeral=True
     )
 
-# /setup team add <@role> <challonge-team-id> TODO
+
+# /setup team <@role> <challonge-team-id> TODO
+@setup.command(name="team", description="Map a Discord team role (auto-assigns team id)")
+@app_commands.describe(
+    slug="tournament slug",
+    role="Discord team role"
+)
+async def setup_team_add(
+    inter: discord.Interaction,
+    slug: str,
+    role: discord.Role
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms", ephemeral=True)
+
+    if not get_settings(slug):
+        return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first.", ephemeral=True)
+
+    name = role.name
+    try:
+        assigned_id = link_team(slug, team_role_id=role.id, team_id=None, display_name=name)
+    except TeamIdInUseError:
+        return await inter.response.send_message(
+            f"could not assign a unique team id for `{slug}`. try again.",
+            ephemeral=True
+        )
+
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title="Team mapped",
+            description="\n".join([
+                f"**Slug:** `{slug}`",
+                f"**Role:** {role.mention} (`{role.id}`)",
+                f"**Team ID:** `{assigned_id}`",
+                f"**Display Name:** `{name}`",
+            ]),
+            color=0xB54882
+        ),
+        ephemeral=True
+    )
+
+
 # /setup team remove [@role] [challonge-team-id] TODO
 # /setup team list TODO
 
@@ -80,7 +129,6 @@ async def setup_channels(inter: discord.Interaction,
 @setup.command(name="status", description="show current config")
 @app_commands.describe(slug="tournament slug")
 async def setup_status(inter: discord.Interaction, slug: str):
-
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms", ephemeral=True)
 
@@ -106,6 +154,7 @@ async def setup_status(inter: discord.Interaction, slug: str):
 
 bot.tree.add_command(setup)
 
+
 # ------------------------ /sync ------------------------
 
 # /sync TODO
@@ -117,21 +166,185 @@ bot.tree.add_command(setup)
 # /reminders list TODO
 
 # ------------------------ /match ------------------------
+
+match = app_commands.Group(name="match", description="match utilities")
+
 # /match start <match_id> TODO
 
 # /match poke <match_id> [time|standard] TODO
 
 # /match settime <match_id> <YYYY-MM-DD HH:MM> TODO
 
-# /match report <match_id> TODO TODO need to develop structure
+# /match report <slug> <match_id> <score_a> <score_b>
+
+@match.command(name="report", description="Report a match score")
+@app_commands.describe(
+    slug="tournament slug",
+    match_id="match id as shown when the round was created",
+    score_a="maps for team A",
+    score_b="maps for team B"
+)
+async def match_report(inter: discord.Interaction, slug: str, match_id: int, score_a: int, score_b: int):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms", ephemeral=True)
+    if score_a < 0 or score_b < 0:
+        return await inter.response.send_message("scores must be non-negative integers.", ephemeral=True)
+
+    m = get_match(slug, match_id)
+    if not m:
+        return await inter.response.send_message(f"match `#{match_id}` not found for `{slug}`.", ephemeral=True)
+
+    record_result(slug, match_id, score_a, score_b)
+    # (Optional) echo which teams if present
+    a = m.get("team_a_role_id"); b = m.get("team_b_role_id")
+    label = f"<@&{a}> vs <@&{b}>" if a and b else f"match #{match_id}"
+    await inter.response.send_message(f"recorded result for {label}: **{score_a}–{score_b}**", ephemeral=True)
+
+
+# /match add <slug> <swiss|double_elim> <round_num>
+
+@match.command(
+    name="add",
+    description="generate and add N Swiss rounds"
+)
+@app_commands.describe(
+    slug="tournament slug",
+    kind="swiss or double_elim (double_elim not implemented yet)",
+    rounds="how many rounds to add from the next round"
+)
+async def match_add(
+    inter: discord.Interaction,
+    slug: str,
+    kind: Literal["swiss", "double_elim"],
+    rounds: int,
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms", ephemeral=True)
+    if not get_settings(slug):
+        return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first", ephemeral=True)
+    if kind != "swiss":
+        return await inter.response.send_message("double_elim not implemented yet.", ephemeral=True)
+    if rounds < 1:
+        return await inter.response.send_message("`rounds` must be ≥ 1.", ephemeral=True)
+
+    created_blocks: list[str] = []
+    latest = get_latest_round(slug)  # 0 if none
+
+    # canonical team list from mappings
+    mapped = list_teams(slug)
+    team_ids = [row["team_role_id"] for row in mapped]
+    if len(team_ids) < 2 or len(team_ids) % 2 != 0:
+        return await inter.response.send_message(
+            "need an **even** number of mapped teams (≥2). Use your planned team mapping commands first.",
+            ephemeral=True
+        )
+
+    for _ in range(rounds):
+        target_round = latest + 1
+
+        if round_exists(slug, target_round):
+            created_blocks.append(f"**Round {target_round}** — already exists (skipped)")
+            latest = target_round
+            continue
+
+        if latest == 0 and target_round == 1:
+            # first round
+            ids = team_ids[:]
+            random.shuffle(ids)
+            pairings = []
+            for i in range(0, len(ids), 2):
+                a, b = ids[i], ids[i + 1]
+                pairings.append({"match_id": None, "team_a_role_id": a, "team_b_role_id": b, "start_time_local": None})
+            assigned = create_swiss_round(slug, target_round, pairings)
+            created_blocks.append(
+                f"**Round {target_round}**\n" +
+                "\n".join(
+                    f"• <@&{pairings[i]['team_a_role_id']}> vs <@&{pairings[i]['team_b_role_id']}>  (#{assigned[i]})"
+                    for i in range(len(pairings)))
+            )
+        else:
+            # later rounds
+            match_count = len(team_ids) // 2
+            pairings = [{"match_id": None, "team_a_role_id": None, "team_b_role_id": None, "start_time_local": None}
+                        for _ in range(match_count)]
+            assigned = create_swiss_round(slug, target_round, pairings)
+            created_blocks.append(
+                f"**Round {target_round} (placeholders)**\n" +
+                "\n".join(f"• (unassigned)  (#{mid})" for mid in assigned)
+            )
+
+        latest = target_round  # advance
+
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title=f"Swiss rounds created — {slug}",
+            description="\n\n".join(created_blocks) if created_blocks else "No rounds created.",
+            color=0xB54882
+        ),
+        ephemeral=True
+    )
+
+
+
+bot.tree.add_command(match)
 
 # ------------------------ /tournament ------------------------
+
+tournament = app_commands.Group(name="tournament", description="tournament utilities")
 
 # /tournament list TODO
 
 # /tournament standings TODO
 
 # /tournament announcement <post:true|false> TODO
+
+
+# /tournament swiss_refresh
+@tournament.command(name="swiss_refresh", description="Generate next Swiss round from latest fully reported results.")
+@app_commands.describe(slug="tournament slug")
+async def match_swiss_refresh(inter: discord.Interaction, slug: str):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms", ephemeral=True)
+    if not get_settings(slug):
+        return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first", ephemeral=True)
+
+    latest = get_latest_fully_reported_round(slug)
+    if not latest:
+        return await inter.response.send_message(
+            "no fully reported Swiss round found yet. report at least one full round first.",
+            ephemeral=True
+        )
+
+    next_round = latest + 1
+    deleted = delete_unreported_round(slug, next_round)
+
+    prev_ms = list_round_matches(slug, latest)
+    team_ids = []
+    for m in prev_ms:
+        for t in (m["team_a_role_id"], m["team_b_role_id"]):
+            if t and t not in team_ids:
+                team_ids.append(t)
+
+    hist = swiss_history(slug)
+    pairs = pair_next_round(team_ids, hist)
+
+    pairings = [{"match_id": None, "team_a_role_id": a, "team_b_role_id": b, "start_time_local": None}
+                for (a, b) in pairs]
+    assigned = create_swiss_round(slug, next_round, pairings)
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title=f"Swiss Round {next_round} created — {slug}",
+            description=f"(deleted {deleted} unreported match(es))\n" +
+                        "\n".join(
+                            f"• <@&{pairings[i]['team_a_role_id']}> vs <@&{pairings[i]['team_b_role_id']}>  (#{assigned[i]})"
+                            for i in range(len(pairings))),
+            color=0xB54882
+        ),
+        ephemeral=True
+    )
+
+
+bot.tree.add_command(tournament)
 
 # ------------------------ misc. ------------------------
 
