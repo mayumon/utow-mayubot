@@ -10,7 +10,6 @@ import random
 from datetime import datetime, timedelta
 from typing import Literal
 
-
 # initialize bot
 intents = discord.Intents.default()
 intents.guilds = True
@@ -50,10 +49,10 @@ setup = app_commands.Group(name="setup", description="configure tournaments")
 @app_commands.describe(tournament_id="tournament ID")
 async def setup_new(inter: discord.Interaction, tournament_id: str):
     if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms", ephemeral=True)
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
 
     upsert_settings(tournament_id)
-    await inter.response.send_message(f"linked ID `{tournament_id}` to a new tournament", ephemeral=True)
+    await inter.response.send_message(f"linked ID `{tournament_id}` to a new tournament.", ephemeral=False)
 
 
 # /setup channels <announcements> <match-chats>
@@ -65,37 +64,38 @@ async def setup_channels(inter: discord.Interaction,
                          tournament_id: str,
                          announcements: discord.TextChannel,
                          match_chats: discord.TextChannel):
-
     if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms", ephemeral=True)
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
 
     if not get_settings(tournament_id):
-        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first", ephemeral=True)
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.",
+                                                 ephemeral=True)
 
     set_channels(tournament_id, announcements.id, match_chats.id)
 
     await inter.response.send_message(
-        f"saved channels {announcements.mention} (announcements) and {match_chats.mention} (match threads) for `{tournament_id}` tournament",
-        ephemeral=True
+        f"saved channels {announcements.mention} (announcements) and {match_chats.mention} (match threads) for `{tournament_id}` tournament.",
+        ephemeral=False
     )
 
 
 # /setup team <@role> <challonge-team-id> TODO
-@setup.command(name="team", description="Map a Discord team role (auto-assigns team id)")
+@setup.command(name="team", description="map a discord team role (auto-assigns team id)")
 @app_commands.describe(
     tournament_id="tournament id",
-    role="Discord team role"
+    role="discord team role"
 )
 async def setup_team_add(
-    inter: discord.Interaction,
-    tournament_id: str,
-    role: discord.Role
+        inter: discord.Interaction,
+        tournament_id: str,
+        role: discord.Role
 ):
     if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms", ephemeral=True)
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
 
     if not get_settings(tournament_id):
-        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.",
+                                                 ephemeral=True)
 
     name = role.name
     try:
@@ -108,16 +108,16 @@ async def setup_team_add(
 
     await inter.response.send_message(
         embed=discord.Embed(
-            title="Team mapped",
+            title="new team mapped",
             description="\n".join([
-                f"**Tournament ID:** `{tournament_id}`",
-                f"**Role:** {role.mention} (`{role.id}`)",
-                f"**Team ID:** `{assigned_id}`",
-                f"**Display Name:** `{name}`",
+                f"**tournament ID:** `{tournament_id}`",
+                f"**role:** {role.mention} (`{role.id}`)",
+                f"**team ID:** `{assigned_id}`",
+                f"**display name:** `{name}`",
             ]),
             color=0xB54882
         ),
-        ephemeral=True
+        ephemeral=False
     )
 
 
@@ -126,11 +126,11 @@ async def setup_team_add(
 
 
 # /setup status
-@setup.command(name="status", description="show current config")
+@setup.command(name="status", description="show current configurations")
 @app_commands.describe(tournament_id="tournament ID")
 async def setup_status(inter: discord.Interaction, tournament_id: str):
     if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms", ephemeral=True)
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
 
     s = get_settings(tournament_id)
 
@@ -143,13 +143,13 @@ async def setup_status(inter: discord.Interaction, tournament_id: str):
     mc = f"<#{s['match_chats_ch']}>" if s['match_chats_ch'] else "-"
 
     desc = "\n".join([
-        f"**Tournament ID:** `{tournament_id}`",
-        f"**Announcements Channel:** {ann}",
-        f"**Match-chats Channel:** {mc}",
-        f"**Teams mapped:** {len(teams)}",
+        f"**tournament ID:** `{tournament_id}`",
+        f"**announcements channel:** {ann}",
+        f"**match-chats channel:** {mc}",
+        f"**teams mapped:** {len(teams)}",
     ])
     await inter.response.send_message(embed=discord.Embed(
-        title="Setup status", description=desc, color=0xeec6db), ephemeral=True)
+        title="setup status", description=desc, color=0xeec6db), ephemeral=True)
 
 
 bot.tree.add_command(setup)
@@ -164,7 +164,158 @@ bot.tree.add_command(setup)
 
 match = app_commands.Group(name="match", description="match utilities")
 
-# /match start <match_id> TODO
+
+# /match thread <match_id>
+@match.command(name="thread", description="create a private match thread for the two teams in a match.")
+@app_commands.describe(
+    tournament_id="tournament ID",
+    match_id="match id as shown when the round was created"
+)
+async def match_thread(
+    inter: discord.Interaction,
+    tournament_id: str,
+    match_id: int
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms", ephemeral=True)
+
+    # --- config checks ---
+    s = get_settings(tournament_id)
+    if not s:
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+
+    ch_id = s.get("match_chats_ch")
+    if not ch_id:
+        return await inter.response.send_message(
+            "match-chats channel not set. run `/setup channels` first.",
+            ephemeral=True
+        )
+
+    if not inter.guild:
+        return await inter.response.send_message("this command must be used in a server.", ephemeral=True)
+
+    channel = inter.guild.get_channel(ch_id)
+    if not isinstance(channel, discord.TextChannel):
+        return await inter.response.send_message("configured match-chats channel is not a text channel.", ephemeral=True)
+
+    m = get_match(tournament_id, match_id)
+    if not m:
+        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
+
+    a_id = m.get("team_a_role_id")
+    b_id = m.get("team_b_role_id")
+    if not a_id or not b_id:
+        return await inter.response.send_message(
+            f"match `#{match_id}` does not have both teams assigned yet.", ephemeral=True
+        )
+
+    a_role = inter.guild.get_role(a_id)
+    b_role = inter.guild.get_role(b_id)
+    if not a_role or not b_role:
+        return await inter.response.send_message(
+            "one or both team roles no longer exist on this server.", ephemeral=True
+        )
+
+    # title
+    phase = (m.get("phase") or "").lower()
+    round_no = m.get("round_no")
+    title_prefix = "Playoffs Round" if phase == "playoff" else "Round"
+    round_label = round_no if round_no is not None else "?"
+    title = f"{title_prefix} {round_label}: {a_role.name} vs {b_role.name}"
+
+    # create a PRIVATE thread (only invited users & mods)
+    try:
+        thread = await channel.create_thread(
+            name=title,
+            type=discord.ChannelType.private_thread,
+            invitable=True,
+            auto_archive_duration=10080
+        )
+    except discord.Forbidden:
+        return await inter.response.send_message(
+            "i dont have permission to create private threads in the configured channel.",
+            ephemeral=True
+        )
+    except Exception as e:
+        return await inter.response.send_message(f"failed to create thread: {e}", ephemeral=True)
+
+    # save thread id
+    try:
+        set_thread(tournament_id, match_id, thread.id)
+    except Exception:
+        # non-fatal; continue
+        pass
+
+    # format scheduled time
+    when_txt = ""
+    raw = m.get("start_time_local")
+    if raw:
+        try:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
+            when_txt = f"{dt.strftime('%B')} {dt.day}, {dt.strftime('%A')} at {dt.strftime('%I:%M%p').lstrip('0')}"
+        except Exception:
+            when_txt = raw  # fallback
+
+    # mention roles
+    mention_text = f"{a_role.mention} {b_role.mention}"
+    body_lines = [
+        mention_text,
+        "use this thread to coordinate your match time!",
+    ]
+    if when_txt:
+        body_lines.append(f"current scheduled time: **{when_txt}**")
+
+    # ensure role pings are allowed in this message
+    allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
+
+    try:
+        await thread.send("\n".join(body_lines), allowed_mentions=allowed)
+    except Exception:
+        # if the first message fails
+        pass
+
+    # proactively invite role members
+    invited = 0
+    for role in (a_role, b_role):
+        try:
+            for member in role.members:
+                try:
+                    await thread.add_user(member)
+                    invited += 1
+                except discord.Forbidden:
+                    # missing perms to add a particular user
+                    continue
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # pointer message to parent
+    pointer_lines = [
+        f"**▶ match thread created:** {thread.mention}",
+    ]
+
+    # don't ping roles in the public pointer
+    no_pings = discord.AllowedMentions(everyone=False, users=False, roles=False)
+
+    try:
+        pointer_msg = await channel.send("\n".join(pointer_lines), allowed_mentions=no_pings)
+
+    except Exception:
+        pass  # pointer is nice-to-have; don't fail the command if it can't be posted
+
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title="match thread created",
+            description="\n".join([
+                f"**channel:** {thread.mention}",
+                f"**title:** {title}",
+                f"**invited members:** {invited}",
+            ]),
+            color=0xB54882
+        ),
+        ephemeral=True
+    )
 
 # /match poke <match_id> [time|standard] TODO
 
@@ -172,7 +323,7 @@ match = app_commands.Group(name="match", description="match utilities")
 
 
 # /match report <tournament_id> <match_id> <score_a> <score_b>
-@match.command(name="report", description="Report a match score")
+@match.command(name="report", description="report a match score")
 @app_commands.describe(
     tournament_id="tournament ID",
     match_id="match id as shown when the round was created",
@@ -181,49 +332,52 @@ match = app_commands.Group(name="match", description="match utilities")
 )
 async def match_report(inter: discord.Interaction, tournament_id: str, match_id: int, score_a: int, score_b: int):
     if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms", ephemeral=True)
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
     if score_a < 0 or score_b < 0:
         return await inter.response.send_message("scores must be non-negative integers.", ephemeral=True)
 
     m = get_match(tournament_id, match_id)
     if not m:
-        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
+        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.",
+                                                 ephemeral=True)
 
     record_result(tournament_id, match_id, score_a, score_b)
 
-    a = m.get("team_a_role_id"); b = m.get("team_b_role_id")
+    a = m.get("team_a_role_id")
+    b = m.get("team_b_role_id")
     label = f"<@&{a}> vs <@&{b}>" if a and b else f"match #{match_id}"
-    await inter.response.send_message(f"recorded result for {label}: **{score_a}–{score_b}**", ephemeral=True)
+    await inter.response.send_message(f"recorded result for {label}: **{score_a}–{score_b}**.", ephemeral=True)
 
 
 # /match add <tournament_id> <swiss|double_elim|round_robin> <round_num>
 @match.command(
     name="add",
-    description="generate and add N Swiss rounds"
+    description="generate and add N swiss rounds"
 )
 @app_commands.describe(
     tournament_id="tournament ID",
-    kind="swiss or double_elim (double_elim not implemented yet)",
-    rounds="how many rounds to add from the next round",
-    start_time="local start time for Round 1 in YYYY-MM-DD HH:MM (e.g., 2025-10-10 20:00)"
+    kind="swiss/double_elim/roundrobin",
+    rounds="how many rounds to add",
+    start_time="local start time for round 1 in YYYY-MM-DD HH:MM format"
 )
 async def match_add(
-    inter: discord.Interaction,
-    tournament_id: str,
-    kind: Literal["swiss", "double_elim"],
-    rounds: int,
-    start_time: str,
+        inter: discord.Interaction,
+        tournament_id: str,
+        kind: Literal["swiss", "double_elim"],
+        rounds: int,
+        start_time: str,
 ):
     if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms", ephemeral=True)
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
     if not get_settings(tournament_id):
-        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first", ephemeral=True)
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.",
+                                                 ephemeral=True)
     if kind != "swiss":
         return await inter.response.send_message("double_elim not implemented yet.", ephemeral=True)
     if rounds < 1:
         return await inter.response.send_message("`rounds` must be ≥ 1.", ephemeral=True)
 
-    # Parse Round 1 baseline time
+    # parse round 1 baseline time
     try:
         base_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
     except ValueError:
@@ -233,9 +387,9 @@ async def match_add(
         )
 
     created_blocks: list[str] = []
-    latest = get_latest_round(tournament_id)  # 0 if none
+    latest = get_latest_round(tournament_id)
 
-    # Team pool
+    # team pool
     mapped = list_teams(tournament_id)
     team_ids = [row["team_role_id"] for row in mapped]
     if len(team_ids) < 2 or len(team_ids) % 2 != 0:
@@ -244,8 +398,8 @@ async def match_add(
             ephemeral=True
         )
 
-    # For pretty names without pinging
     name_map = get_team_display_map(tournament_id)
+
     def label(role_id: int | None) -> str:
         if role_id is None:
             return "TBD"
@@ -255,13 +409,13 @@ async def match_add(
         target_round = latest + 1
 
         if round_exists(tournament_id, target_round):
-            # If it already exists, still show a block so caller knows it was skipped
+            # still show a block so user knows it was skipped
             round_date = (base_dt + timedelta(weeks=(target_round - 1))).strftime("%B %d, %Y at %I:%M%p")
             created_blocks.append(f"》Round {target_round}\n(already exists)\n\n[{round_date}]")
             latest = target_round
             continue
 
-        # Compute this round's start timestamp string
+        # compute round's start timestamp string
         r_start_dt = base_dt + timedelta(weeks=(target_round - 1))
         r_start_str = r_start_dt.strftime("%Y-%m-%d %H:%M")
         round_date_pretty = r_start_dt.strftime("%B %d, %Y at %I:%M%p")
@@ -269,7 +423,7 @@ async def match_add(
         lines: list[str] = [f"》Round {target_round}"]
 
         if latest == 0 and target_round == 1:
-            # Round 1: assign pairings now
+            # round 1: assign pairings now
             ids = team_ids[:]
             random.shuffle(ids)
             pairings = []
@@ -283,13 +437,13 @@ async def match_add(
                 })
             assigned = create_swiss_round(tournament_id, target_round, pairings)
 
-            # Output (no emojis yet since scores are unknown; show "score: -")
+            # output
             for i, mid in enumerate(assigned):
                 a = label(pairings[i]["team_a_role_id"])
                 b = label(pairings[i]["team_b_role_id"])
                 lines.append(f"☆ match #{mid}:\n{a} vs {b} ━ score: -")
         else:
-            # Later rounds: placeholders with dates set (TBD names)
+            # later rounds: placeholders with dates set (TBD names)
             match_count = len(team_ids) // 2
             pairings = [{
                 "match_id": None,
@@ -302,7 +456,7 @@ async def match_add(
             for mid in assigned:
                 lines.append(f"☆ match #{mid}: TBD vs TBD ━ score: -")
 
-        # One date line per round
+        # one date line per round
         lines.append(f"[{round_date_pretty}]")
 
         created_blocks.append("\n".join(lines))
@@ -318,9 +472,6 @@ async def match_add(
     )
 
 
-
-
-
 bot.tree.add_command(match)
 
 # ------------------------ /tournament ------------------------
@@ -329,7 +480,7 @@ tournament = app_commands.Group(name="tournament", description="tournament utili
 
 
 # /tournament list
-@tournament.command(name="list", description="List all matches by round with scores & dates.")
+@tournament.command(name="list", description="list all matches by round with scores and dates")
 @app_commands.describe(slug="tournament slug")
 async def tournament_list(inter: discord.Interaction, slug: str):
     if not get_settings(slug):
@@ -347,8 +498,10 @@ async def tournament_list(inter: discord.Interaction, slug: str):
         return name_map.get(role_id, f"<@&{role_id}>")
 
     def ordinal(n: int) -> str:
-        if 10 <= (n % 100) <= 20: suf = "th"
-        else: suf = {1:"st",2:"nd",3:"rd"}.get(n % 10, "th")
+        if 10 <= (n % 100) <= 20:
+            suf = "th"
+        else:
+            suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
         return f"{n}{suf}"
 
     from datetime import datetime
@@ -400,7 +553,8 @@ async def tournament_list(inter: discord.Interaction, slug: str):
         for r in sorted(round_matches, key=lambda x: x["match_id"]):
             a = team_label(r["team_a_role_id"])
             b = team_label(r["team_b_role_id"])
-            sa = r["score_a"]; sb = r["score_b"]
+            sa = r["score_a"]
+            sb = r["score_b"]
 
             if r["reported"] and sa is not None and sb is not None:
                 score_text = f"{sa}-{sb}"
@@ -414,10 +568,10 @@ async def tournament_list(inter: discord.Interaction, slug: str):
 
         chunk_size = 8
         for i in range(0, len(blocks), chunk_size):
-            chunk = blocks[i:i+chunk_size]
+            chunk = blocks[i:i + chunk_size]
             header = f"**》Round {rn if rn is not None else '-'}**"
             if len(blocks) > chunk_size:
-                header += f" (part {i//chunk_size + 1})"
+                header += f" (part {i // chunk_size + 1})"
             value = "\n\n".join(chunk)
             current.add_field(name=header, value=value, inline=False)
             fields_in_current += 1
@@ -430,7 +584,7 @@ async def tournament_list(inter: discord.Interaction, slug: str):
 
     await inter.response.send_message(embed=embeds[0], ephemeral=True)
     for e in embeds[1:]:
-        await inter.followup.send(embed=e, ephemeral=True)
+        await inter.followup.send(embed=e, ephemeral=False)
 
 
 # /tournament standings TODO
@@ -462,7 +616,7 @@ async def tournament_swiss_refresh(inter: discord.Interaction, tournament_id: st
     # next round must already exist (placeholders created earlier via /match add)
     if not round_exists(tournament_id, next_round):
         return await inter.response.send_message(
-            f"round {next_round} does not exist yet. create placeholders first: `/match add tournament_id:{tournament_id} kind:swiss rounds:1`",
+            f"round {next_round} does not exist yet. create placeholders first: `/match add tournament_id:{tournament_id} kind:swiss rounds:1`.",
             ephemeral=True
         )
     if not round_has_placeholders(tournament_id, next_round):
@@ -509,9 +663,11 @@ async def tournament_swiss_refresh(inter: discord.Interaction, tournament_id: st
 
 bot.tree.add_command(tournament)
 
+
 # ------------------------ misc. ------------------------
 
 # /help TODO
+
 
 def run():
     logging.basicConfig(level=logging.INFO)
