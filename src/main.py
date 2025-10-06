@@ -1,7 +1,7 @@
 import logging
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from .config import DISCORD_TOKEN
 from .storage import *
 from .swiss_helpers import *
@@ -9,11 +9,15 @@ from collections import defaultdict
 import random
 from datetime import datetime, timedelta
 from typing import Literal
+from zoneinfo import ZoneInfo
+import asyncio
 
 # initialize bot
 intents = discord.Intents.default()
 intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+log = logging.getLogger("reminders")
 
 
 @bot.event
@@ -25,6 +29,8 @@ async def on_ready():
         print(f"✅ synced {len(synced)} command(s)")
     except Exception as e:
         print(f"❌ sync failed: {e}")
+
+    asyncio.create_task(reminder_worker(bot))
 
 
 # ------------------------ diagnostics ------------------------
@@ -39,7 +45,16 @@ def staff_only(inter: discord.Interaction) -> bool:
     return bool(m and m.guild_permissions.manage_guild)
 
 
+def _parse_local_dt(s: str, tzname: str) -> datetime | None:
+    # s: "YYYY-MM-DD HH:MM" (local)
+    try:
+        naive = datetime.strptime(s, "%Y-%m-%d %H:%M")
+        return naive.replace(tzinfo=ZoneInfo(tzname))
+    except Exception:
+        return None
+
 # ------------------------ /setup ------------------------
+
 
 setup = app_commands.Group(name="setup", description="configure tournaments")
 
@@ -262,9 +277,134 @@ bot.tree.add_command(setup)
 
 # ------------------------ /reminders ------------------------
 
-# /reminders set [match_id] TODO
+reminders = app_commands.Group(name="reminders", description="match reminders to match threads")
 
-# /reminders list TODO
+
+# /reminders set [match_id]
+@reminders.command(name="set", description="schedule reminders (1h + noon/2h) for a match or all matches")
+@app_commands.describe(
+    tournament_id="tournament ID",
+    match_id="match ID (optional; if omitted, schedules for all matches with times)"
+)
+async def reminders_set(
+    inter: discord.Interaction,
+    tournament_id: str,
+    match_id: int | None = None
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
+    if not get_settings(tournament_id):
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+
+    if match_id is not None:
+        m = get_match(tournament_id, match_id)
+        if not m:
+            return await inter.response.send_message(
+                f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True
+            )
+        if not m.get("start_time_local"):
+            return await inter.response.send_message(
+                f"match `#{match_id}` has no scheduled time yet.", ephemeral=True
+            )
+        n = schedule_match_reminders(tournament_id, match_id)
+        m2 = get_match(tournament_id, match_id)
+        has_thread = bool(m2 and m2.get("thread_id"))
+        suffix = " (no thread — reminders will not post)" if not has_thread else ""
+        return await inter.response.send_message(
+            f"scheduled {n} reminder(s) for match `#{match_id}`{suffix}.",
+            ephemeral=True
+        )
+    else:
+        matches_updated, reminders_total = schedule_all_match_reminders(tournament_id)
+        rows = list_matches(tournament_id, with_time_only=True)
+        no_thread = [r["match_id"] for r in rows if r.get("start_time_local") and not r.get("thread_id")]
+        suffix = ""
+        if no_thread:
+            preview = ", ".join(f"#{int(x)}" for x in no_thread[:5])
+            more = "" if len(no_thread) <= 5 else f" (+{len(no_thread) - 5} more)"
+            suffix = f"\n⚠ {len(no_thread)} match(es) have no thread: {preview}{more}. Reminders for these will not post."
+
+        return await inter.response.send_message(
+            f"scheduled reminders for **{matches_updated}** match(es), **{reminders_total}** reminder(s) total.{suffix}",
+            ephemeral=True
+        )
+
+
+# /reminders list
+@reminders.command(name="list", description="list scheduled reminders (pending & sent)")
+@app_commands.describe(
+    tournament_id="tournament ID",
+    match_id="match ID (optional)"
+)
+async def reminders_list(
+    inter: discord.Interaction,
+    tournament_id: str,
+    match_id: int | None = None
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
+    if not get_settings(tournament_id):
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+
+    rows = list_reminders(tournament_id, match_id)
+    if not rows:
+        return await inter.response.send_message("no reminders scheduled.", ephemeral=True)
+
+    # resolve tournament timezone
+    s = get_settings(tournament_id)
+    tz = s["tz"] if s and s.get("tz") else "America/Toronto"
+    tzinfo = safe_zoneinfo(tz)
+
+    # group by match
+    from collections import defaultdict
+    by_match = defaultdict(list)
+    for r in rows:
+        by_match[int(r["match_id"])].append(r)
+
+    embed = discord.Embed(
+        title=f"Reminders — {tournament_id}",
+        color=0xB54882
+    )
+    embed.set_footer(text=f"All times shown in {tz}")
+
+    def fmt_row(r):
+        status = "✅ sent" if int(r["sent"]) else "⏳ pending"
+        # convert stored UTC (string) -> local display
+        dt_utc = datetime.strptime(r["when_utc"], "%Y-%m-%d %H:%M").replace(tzinfo=safe_zoneinfo("UTC"))
+        dt_loc = dt_utc.astimezone(tzinfo)
+        local_txt = dt_loc.strftime("%Y-%m-%d %H:%M")
+        return f"- `{r['kind']}` at `{local_txt}` — {status}", dt_utc
+
+    for mid in sorted(by_match.keys()):
+
+        triples = []
+        for r in by_match[mid]:
+            line, dt_utc = fmt_row(r)
+            kind = r.get("kind", "")
+            triples.append((dt_utc, kind, line))
+
+        triples.sort(key=lambda x: (x[0], x[1]))
+        lines = [t[2] for t in triples]
+
+        if not lines:
+            continue
+
+        chunk, acc_len = [], 0
+        for ln in lines:
+            chunk.append(ln)
+            acc_len += len(ln)
+            if acc_len > 900:
+                embed.add_field(name=f"match #{mid}", value="\n".join(chunk), inline=False)
+                chunk, acc_len = [], 0
+        if chunk:
+            embed.add_field(name=f"match #{mid}", value="\n".join(chunk), inline=False)
+
+    await inter.response.send_message(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(reminders)
 
 # ------------------------ /match ------------------------
 
@@ -463,6 +603,14 @@ async def match_settime(
     # save to db
     set_match_time(tournament_id, match_id, dt.strftime("%Y-%m-%d %H:%M"))
 
+    # regenerate this match's reminders
+    try:
+        scheduled = schedule_match_reminders(tournament_id, match_id)
+        scheduled_msg = f"scheduled {scheduled} reminder(s)."
+    except Exception as e:
+        scheduled = 0
+        scheduled_msg = f"couldn't schedule reminders ({e})."
+
     # format
     pretty = f"{dt.strftime('%B')} {dt.day}, {dt.strftime('%A')} at {dt.strftime('%I:%M%p').lstrip('0')}"
 
@@ -496,7 +644,8 @@ async def match_settime(
                 f"**time:** {pretty}",
                 ("_update posted and teams pinged in thread_" if mentioned else
                  "_update posted in thread (no pings)_" if posted_update else
-                 "_no thread to update_")
+                 "_no thread to update_"),
+                f"**reminders:** {scheduled_msg}",
             ]),
             color=0xB54882
         ),
@@ -842,6 +991,111 @@ bot.tree.add_command(tournament)
 # ------------------------ misc. ------------------------
 
 # /help TODO
+
+async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> bool:
+    slug = payload["tournament_name"]
+    mid = int(payload["match_id"])
+    kind = payload["kind"]
+    thread_id = payload.get("thread_id")
+
+    # load settings + match
+    s = get_settings(slug)
+    if not s:
+        log.warning(f"[reminders] settings missing for {slug}")
+        return False
+    tz = s.get("tz") or "America/Toronto"
+
+    m = get_match(slug, mid)
+    if not m:
+        log.warning(f"[reminders] match #{mid} missing for {slug}")
+        return False
+
+    # MUST have an existing thread id; otherwise bail (no auto-create)
+    if not thread_id:
+        log.info(f"[reminders] match #{mid} has no thread_id; skipping.")
+        return False
+
+    # resolve thread from API/cache
+    thread: discord.Thread | None = None
+    try:
+        ch = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
+        if isinstance(ch, discord.Thread):
+            thread = ch
+        else:
+            log.info(f"[reminders] channel {thread_id} is not a Thread; skipping.")
+            return False
+    except discord.NotFound:
+        log.info(f"[reminders] thread_id {thread_id} not found (maybe deleted); skipping.")
+        return False
+    except discord.Forbidden:
+        log.warning(f"[reminders] forbidden fetching thread {thread_id}; skipping.")
+        return False
+    except Exception as e:
+        log.exception(f"[reminders] error fetching thread {thread_id}: {e}")
+        return False
+
+    # join if needed
+    try:
+        if isinstance(thread, discord.Thread) and thread.me is not None and not thread.me.joined:
+            await thread.join()
+    except Exception:
+        pass
+
+    # pretty time (local)
+    pretty = ""
+    if m.get("start_time_local"):
+        try:
+            dt = datetime.strptime(m["start_time_local"], "%Y-%m-%d %H:%M").replace(tzinfo=safe_zoneinfo(tz))
+            pretty = f"{dt.strftime('%B')} {dt.day}, {dt.strftime('%A')} at {dt.strftime('%I:%M%p').lstrip('0')}"
+        except Exception:
+            pretty = m["start_time_local"]
+
+    a_id = m.get("team_a_role_id")
+    b_id = m.get("team_b_role_id")
+    mention = " ".join([f"<@&{a_id}>" if a_id else "", f"<@&{b_id}>" if b_id else ""]).strip()
+
+    prefix = "🕑  reminder"
+    if kind == "noon":
+        body = f"{prefix}: day-of reminder for **match #{mid}** — starts **{pretty}**."
+    elif kind == "pre2h":
+        body = f"{prefix}: **2 hours** until **match #{mid}** — starts **{pretty}**."
+    else:
+        body = f"{prefix}: **1 hour** until **match #{mid}** — starts **{pretty}**."
+
+    try:
+        await thread.send(
+            f"{mention}\n{body}",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
+        )
+        log.info(f"[reminders] posted {kind} for {slug} match #{mid} in thread {thread.id}")
+        return True
+    except discord.Forbidden:
+        log.warning(f"[reminders] forbidden sending to thread {thread.id}")
+        return False
+    except Exception as e:
+        log.exception(f"[reminders] error sending to thread {thread.id}: {e}")
+        return False
+
+
+
+async def reminder_worker(bot: commands.Bot):
+    await bot.wait_until_ready()
+    log.info("[reminders] worker started")
+    while not bot.is_closed():
+        try:
+            now_utc = datetime.utcnow().replace(tzinfo=None)
+            due = fetch_due_reminders(now_utc, limit=100)
+            if due:
+                log.info(f"[reminders] {len(due)} reminder(s) due at <= {now_utc.strftime('%Y-%m-%d %H:%M')}")
+            for r in due:
+                ok = await _post_reminder_to_thread(bot, r)
+                if ok:
+                    mark_reminder_sent(int(r["id"]))
+                else:
+                    log.info(f"[reminders] failed to deliver id={r['id']} ({r['kind']}) for match #{r['match_id']}")
+        except Exception as e:
+            log.exception(f"[reminders] worker loop error: {e}")
+        await asyncio.sleep(60)
 
 
 def run():

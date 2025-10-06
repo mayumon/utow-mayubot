@@ -51,6 +51,24 @@ CREATE TABLE IF NOT EXISTS matches (
     PRIMARY KEY (tournament_name, match_id)
 );
 
+CREATE TABLE IF NOT EXISTS swiss_meta (
+    tournament_name  TEXT PRIMARY KEY REFERENCES settings(tournament_name),
+    rounds          INTEGER NOT NULL
+);
+
+-- Reminders
+CREATE TABLE IF NOT EXISTS reminders (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_name  TEXT NOT NULL,
+    match_id         INTEGER NOT NULL,
+    when_utc         TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    sent             INTEGER DEFAULT 0,
+    FOREIGN KEY (tournament_name, match_id)
+      REFERENCES matches(tournament_name, match_id) ON DELETE CASCADE,
+    UNIQUE (tournament_name, match_id, kind)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_matches_time
     ON matches(tournament_name, start_time_local);
@@ -61,10 +79,9 @@ CREATE INDEX IF NOT EXISTS idx_teams_challonge_id
 CREATE INDEX IF NOT EXISTS idx_matches_phase_round
     ON matches(tournament_name, phase, round_no);
     
-CREATE TABLE IF NOT EXISTS swiss_meta (
-    tournament_name  TEXT PRIMARY KEY REFERENCES settings(tournament_name),
-    rounds          INTEGER NOT NULL
-);
+CREATE INDEX IF NOT EXISTS idx_reminders_due
+  ON reminders(when_utc, sent);
+    
 
 """
 class TeamIdInUseError(Exception):
@@ -538,3 +555,174 @@ def list_all_matches_full(slug: str) -> list[dict]:
               match_id
         """, (slug,))
         return [dict(r) for r in cur.fetchall()]
+
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
+
+def _iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+def _parse_local(start_time_local: str, tz_str: str) -> datetime:
+    # start_time_local: "YYYY-MM-DD HH:MM" (naive, stored as local)
+    naive = datetime.strptime(start_time_local, "%Y-%m-%d %H:%M")
+    return naive.replace(tzinfo=ZoneInfo(tz_str))
+
+
+def schedule_match_reminders(slug: str, match_id: int) -> int:
+
+    # load match + tz
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT start_time_local
+            FROM matches
+            WHERE tournament_name=? AND match_id=?
+        """, (slug, match_id))
+        m = cur.fetchone()
+        if not m or not m["start_time_local"]:
+            return 0
+
+        cur.execute("SELECT tz FROM settings WHERE tournament_name=?", (slug,))
+        s = cur.fetchone()
+        tz = s["tz"] if s and s["tz"] else "America/Toronto"
+
+    tzinfo = safe_zoneinfo(tz)
+
+    # parse local start
+    start_local = datetime.strptime(m["start_time_local"], "%Y-%m-%d %H:%M").replace(tzinfo=tzinfo)
+    start_utc = start_local.astimezone(safe_zoneinfo("UTC"))
+    now_utc = _now_utc_naive()
+    now_local = datetime.utcnow().replace(tzinfo=safe_zoneinfo("UTC")).astimezone(tzinfo)
+
+    desired: list[tuple[str, datetime]] = []
+
+    pre1h_local = start_local - timedelta(hours=1)
+    pre1h_utc = pre1h_local.astimezone(safe_zoneinfo("UTC"))
+
+    early_kind = None
+    early_dt_local = None
+
+    if start_local.hour < 14:
+        early_kind = "pre2h"
+        early_dt_local = start_local - timedelta(hours=2)
+    else:
+        early_kind = "noon"
+        early_dt_local = start_local.replace(hour=12, minute=0)
+
+        # if noon already passed, try pre2h instead
+        if early_dt_local <= now_local:
+            alt = start_local - timedelta(hours=2)
+            if alt > now_local:
+                early_kind = "pre2h"
+                early_dt_local = alt
+            else:
+                early_kind = None  # drop early reminder entirely
+
+    if early_kind is not None:
+        desired.append((early_kind, early_dt_local.astimezone(safe_zoneinfo("UTC"))))
+    desired.append(("pre1h", pre1h_utc))
+
+    # if pre1h is past, schedule asap
+    fixed: list[tuple[str, datetime]] = []
+    for kind, when_dt_utc in desired:
+        # store minute precision
+        when_dt_utc = when_dt_utc.replace(second=0, microsecond=0)
+        if when_dt_utc.replace(tzinfo=None) <= now_utc:
+            if kind == "pre1h":
+                asap = (datetime.utcnow() + timedelta(minutes=1)).replace(second=0, microsecond=0)
+                fixed.append((kind, asap.replace(tzinfo=None)))
+            else:
+                # drop early reminder if its already past
+                continue
+        else:
+            fixed.append((kind, when_dt_utc.replace(tzinfo=None)))
+
+    # upsert + reset sent, delete obsolete kinds
+    desired_kinds = {k for k, _ in fixed}
+    with connect() as con:
+        # delete kinds we no longer want
+        if desired_kinds:
+            con.execute(f"""
+                DELETE FROM reminders
+                 WHERE tournament_name=? AND match_id=? AND kind NOT IN ({",".join("?"*len(desired_kinds))})
+            """, (slug, match_id, *desired_kinds))
+        else:
+            con.execute("""
+                DELETE FROM reminders
+                 WHERE tournament_name=? AND match_id=?
+            """, (slug, match_id))
+
+        # upsert wanted kinds, reset sent=0
+        for kind, when_utc in fixed:
+            con.execute("""
+                INSERT INTO reminders(tournament_name, match_id, when_utc, kind, sent)
+                VALUES(?, ?, ?, ?, 0)
+                ON CONFLICT(tournament_name, match_id, kind)
+                DO UPDATE SET when_utc=excluded.when_utc, sent=0
+            """, (slug, match_id, when_utc.strftime("%Y-%m-%d %H:%M"), kind))
+
+    return len(fixed)
+
+
+def list_reminders(slug: str, match_id: int | None = None) -> list[dict]:
+    with connect() as con:
+        cur = con.cursor()
+        if match_id is None:
+            cur.execute("SELECT id, match_id, when_utc, kind, sent FROM reminders "
+                        "WHERE tournament_name=? ORDER BY when_utc", (slug,))
+        else:
+            cur.execute("SELECT id, match_id, when_utc, kind, sent FROM reminders "
+                        "WHERE tournament_name=? AND match_id=? ORDER BY when_utc", (slug, match_id))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def fetch_due_reminders(now_utc: datetime, limit: int = 50) -> list[dict]:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT r.id, r.tournament_name, r.match_id, r.when_utc, r.kind,
+                   m.thread_id, m.team_a_role_id, m.team_b_role_id
+            FROM reminders r
+            JOIN matches m
+              ON m.tournament_name=r.tournament_name AND m.match_id=r.match_id
+            WHERE r.sent=0 AND r.when_utc <= ?
+            ORDER BY r.when_utc ASC
+            LIMIT ?
+        """, (_iso(now_utc), limit))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def mark_reminder_sent(reminder_id: int) -> None:
+    with connect() as con:
+        con.execute("UPDATE reminders SET sent=1 WHERE id=?", (reminder_id,))
+
+
+def _now_utc_naive() -> datetime:
+    return datetime.utcnow().replace(tzinfo=None)
+
+
+def safe_zoneinfo(tz_name: str):
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        try:
+            from dateutil.tz import gettz
+            z = gettz(tz_name)
+            if z:
+                return z
+        except Exception:
+            pass
+        return ZoneInfo("UTC")
+
+
+def schedule_all_match_reminders(slug: str) -> tuple[int, int]:
+    rows = list_matches(slug, with_time_only=True)
+    matches_updated = 0
+    reminders_total = 0
+    for r in rows:
+        mid = int(r["match_id"])
+        n = schedule_match_reminders(slug, mid)
+        if n > 0:
+            matches_updated += 1
+            reminders_total += n
+    return matches_updated, reminders_total
