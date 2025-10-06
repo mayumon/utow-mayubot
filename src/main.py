@@ -913,7 +913,177 @@ async def tournament_list(inter: discord.Interaction, slug: str):
 
 # /tournament standings TODO
 
-# /tournament announcement <post:true|false> TODO
+# /tournament announcement <post:true|false>
+@tournament.command(
+    name="announcement",
+    description="post (or preview) last round results and next round games"
+)
+@app_commands.describe(slug="tournament slug", post="post it?")
+async def tournament_announcement(inter: discord.Interaction, slug: str, post: bool):
+    if not get_settings(slug):
+        return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first.", ephemeral=True)
+
+    s = get_settings(slug)
+    tz = s["tz"] if s and s.get("tz") else "America/Toronto"
+    ann_ch_id = s.get("announcements_ch")
+
+    # helpers
+    name_map = get_team_display_map(slug)
+
+    def label(role_id: int | None) -> str:
+        if role_id is None:
+            return "TBD"
+        return name_map.get(role_id, f"<@&{role_id}>")
+
+    def mention_label(role_id: int | None) -> str:
+        if role_id is None:
+            return "@unknown-role"
+        return f"<@&{role_id}>"
+
+    def ordinal(n: int) -> str:
+        if 10 <= (n % 100) <= 20:
+            suf = "th"
+        else:
+            suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+        return f"{n}{suf}"
+
+    def fmt_when_local(s_local: str | None) -> str | None:
+        if not s_local:
+            return None
+        try:
+            dt = datetime.strptime(s_local, "%Y-%m-%d %H:%M").replace(tzinfo=safe_zoneinfo(tz))
+            dow = dt.strftime("%A").lower()
+            mon = dt.strftime("%b").lower()
+            day = ordinal(dt.day)
+            t12 = dt.strftime("%I:%M%p").lstrip("0")
+            z = dt.tzname() or ""
+            return f"[{dow} ({mon} {day}) at {t12} {z}]".strip()
+        except Exception:
+            return f"[{s_local}]"
+
+    # ----- build "last week" section -----
+    latest = get_latest_fully_reported_round(slug)
+    last_lines: list[str] = []
+    if latest:
+        ms = list_round_matches(slug, latest)
+        for m in ms:
+            a = label(m["team_a_role_id"])
+            b = label(m["team_b_role_id"])
+            sa = m.get("score_a")
+            sb = m.get("score_b")
+            if m.get("reported") and sa is not None and sb is not None:
+                if sa > sb:
+                    winner = a
+                elif sb > sa:
+                    winner = b
+                else:
+                    winner = "Draw"
+                # No bold on the pair; :star: before each team; show winner + score
+                last_lines.append(f"• :star: {a} vs. :star: {b}: {winner} win ({sa}–{sb})")
+        if not last_lines:
+            last_lines.append("• No completed matches recorded.")
+    else:
+        last_lines.append("• No fully reported round yet.")
+
+    # ----- build "this week" section -----
+    next_lines: list[str] = []
+    next_round = (latest or 0) + 1
+    if round_exists(slug, next_round):
+        ms_next = list_round_matches(slug, next_round)
+        for m in ms_next:
+            a = mention_label(m["team_a_role_id"])  # ping roles
+            b = mention_label(m["team_b_role_id"])
+            when_line = fmt_when_local(m.get("start_time_local"))
+            top = f"{a} vs. {b}"
+            next_lines.append(top + (f"\n{when_line}" if when_line else ""))
+    else:
+        next_lines.append("• Next round not created yet.")
+
+    # ----- build compact "TOURNAMENT STATUS" section (no dates, single line per match) -----
+    all_rows = list_all_matches_full(slug)
+    grouped: dict[int | None, list[dict]] = defaultdict(list)
+    for r in all_rows:
+        grouped[r["round_no"]].append(r)
+
+    def team_label(role_id: int | None) -> str:
+        if role_id is None:
+            return "TBD"
+        return name_map.get(role_id, f"<@&{role_id}>")
+
+    round_sections: list[str] = []
+    for rn in sorted(grouped.keys(), key=lambda x: (x is None, x if x is not None else 0)):
+        lines: list[str] = []
+        lines.append(f"》Round {rn if rn is not None else '-'}")
+        for r in sorted(grouped[rn], key=lambda x: x["match_id"]):
+            a = team_label(r["team_a_role_id"])
+            b = team_label(r["team_b_role_id"])
+            sa, sb = r.get("score_a"), r.get("score_b")
+            score_text = f"{sa}-{sb}" if r.get("reported") and sa is not None and sb is not None else "_ - _"
+            # Single compact line, with small padding before teams for readability
+            lines.append(f"☆ match #{r['match_id']}:    {a} vs {b} ━ score: {score_text}")
+        round_sections.append("\n".join(lines))
+
+    list_text = "\n\n".join(round_sections) if round_sections else "No matches yet."
+
+    # ----- compose message (intro + dividers + sections) -----
+    divider = "—" * 64
+    header_last = ":feet: **MATCHES LAST WEEK!**"
+    header_next = ":feet: **MATCHES THIS WEEK!**"
+    header_status = ":cat: **TOURNAMENT STATUS**"
+
+    intro = (
+        "hi everyone! here is the weekly announcement.\n"
+        "please discuss rescheduling asap! for any questions, please refer to the rulebook or contact staff.\n"
+        "good luck! <3"
+    )
+
+    last_text = "\n".join(last_lines) if last_lines else "• —"
+    next_text = "\n\n".join(next_lines) if next_lines else "• —"
+
+    msg = (
+        f"{intro}\n\n"
+        f"{divider}\n"
+        f"{header_last}\n\n"
+        f"{last_text}\n\n"
+        f"{divider}\n"
+        f"{header_next}\n\n"
+        f"{next_text}\n\n"
+        f"{divider}\n"
+        f"{header_status}\n\n"
+        f"{list_text}"
+    )
+
+    # post or preview
+    if post:
+        if not ann_ch_id:
+            return await inter.response.send_message(
+                "announcements channel not set. use `/setup channels` first.",
+                ephemeral=True
+            )
+        if not inter.guild:
+            return await inter.response.send_message("run this in a server.", ephemeral=True)
+        ch = inter.guild.get_channel(ann_ch_id)
+        if not isinstance(ch, discord.TextChannel):
+            return await inter.response.send_message("configured announcements channel is invalid.", ephemeral=True)
+
+        chunks: list[str] = []
+        cur, cur_len = [], 0
+        for line in msg.split("\n"):
+            if cur_len + len(line) + 1 > 1900:
+                chunks.append("\n".join(cur))
+                cur, cur_len = [], 0
+            cur.append(line)
+            cur_len += len(line) + 1
+        if cur:
+            chunks.append("\n".join(cur))
+
+        # allow role pings (for "this week" section)
+        allow = discord.AllowedMentions(roles=True, users=False, everyone=False)
+        for chunk in chunks:
+            await ch.send(chunk, allowed_mentions=allow)
+        return await inter.response.send_message("Announcement posted ✅", ephemeral=True)
+    else:
+        return await inter.response.send_message(msg, ephemeral=True)
 
 
 # /tournament swiss_refresh
