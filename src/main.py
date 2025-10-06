@@ -78,11 +78,13 @@ async def setup_channels(inter: discord.Interaction,
         ephemeral=False
     )
 
+team = app_commands.Group(name="team", description="map/manage teams", parent=setup)
 
-# /setup team <@role> <challonge-team-id> TODO
-@setup.command(name="team", description="map a discord team role (auto-assigns team id)")
+
+# /setup team <@role>
+@team.command(name="add", description="map a discord team role (auto-assigns team id)")
 @app_commands.describe(
-    tournament_id="tournament id",
+    tournament_id="tournament ID",
     role="discord team role"
 )
 async def setup_team_add(
@@ -121,8 +123,112 @@ async def setup_team_add(
     )
 
 
-# /setup team remove [@role] [challonge-team-id] TODO
-# /setup team list TODO
+# /setup team remove [@role] [challonge-team-id]
+@team.command(name="remove", description="unmap a team by Discord role or team ID")
+@app_commands.describe(
+    tournament_id="tournament ID",
+    role="discord team role (optional)",
+    team_id="team ID (optional)"
+)
+async def setup_team_remove(
+    inter: discord.Interaction,
+    tournament_id: str,
+    role: discord.Role | None = None,
+    team_id: int | None = None
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
+    # tournament must exist
+    if not get_settings(tournament_id):
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.",
+                                                 ephemeral=True)
+
+    # need at least one selector
+    if role is None and team_id is None:
+        return await inter.response.send_message(
+            "provide either a **role** or a **team_id**.", ephemeral=True
+        )
+
+    # resolve mapping
+    mapping = None
+    if role is not None:
+        mapping = get_team_by_role(role.id)
+        if mapping and mapping.get("tournament_name") != tournament_id:
+            mapping = None
+    elif team_id is not None:
+        mapping = get_team_by_participant(tournament_id, team_id)
+
+    if not mapping:
+        return await inter.response.send_message(
+            "no matching team mapping found for the given input.", ephemeral=True
+        )
+
+    rid = int(mapping["team_role_id"])
+    dn = mapping.get("display_name") or f"<@&{rid}>"
+    tid = int(mapping["team_id"])
+
+    # unlink
+    unlink_team(rid)
+
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title="team mapping removed",
+            description="\n".join([
+                f"**tournament:** `{tournament_id}`",
+                f"**role:** <@&{rid}> (`{rid}`)",
+                f"**team id:** `{tid}`",
+                f"**display name:** `{dn}`",
+            ]),
+            color=0xB54882
+        ),
+        ephemeral=False
+    )
+
+
+# /setup team list
+@team.command(name="list", description="list mapped teams for a tournament")
+@app_commands.describe(tournament_id="tournament ID")
+async def setup_team_list(inter: discord.Interaction, tournament_id: str):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
+    if not get_settings(tournament_id):
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.",
+                                                 ephemeral=True)
+
+    rows = list_teams(tournament_id)
+    if not rows:
+        return await inter.response.send_message(f"no teams mapped yet for `{tournament_id}`.", ephemeral=True)
+
+    # sort by team_id
+    rows.sort(key=lambda r: (int(r["team_id"]), (r["display_name"] or "").lower()))
+
+    lines = []
+    for r in rows:
+        rid = int(r["team_role_id"])
+        tid = int(r["team_id"])
+        dn = (r["display_name"] or "").strip()
+        label = dn if dn else f"<@&{rid}>"
+        lines.append(f"• **{label}** — team_id `{tid}` — role <@&{rid}>")
+
+    embed = discord.Embed(
+        title=f"Teams — {tournament_id}",
+        color=0xB54882
+    )
+
+    chunk = []
+    count = 0
+    for i, line in enumerate(lines, 1):
+        chunk.append(line)
+        count += 1
+        if count >= 20:
+            embed.add_field(name="\u200b", value="\n".join(chunk), inline=False)
+            chunk, count = [], 0
+    if chunk:
+        embed.add_field(name="\u200b", value="\n".join(chunk), inline=False)
+
+    await inter.response.send_message(embed=embed, ephemeral=True)
 
 
 # /setup status
@@ -592,7 +698,7 @@ async def tournament_list(inter: discord.Interaction, slug: str):
             month = dt.strftime("%B")
             day = ordinal(dt.day)
             year = dt.year
-            time12 = dt.strftime("%-I:%M%p") if hasattr(dt, "strftime") else dt.strftime("%I:%M%p").lstrip("0")
+            time12 = dt.strftime("%I:%M%p").lstrip("0") if hasattr(dt, "strftime") else dt.strftime("%I:%M%p").lstrip("0")
 
             if time12.startswith("0"):
                 time12 = time12[1:]
