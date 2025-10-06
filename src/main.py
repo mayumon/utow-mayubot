@@ -169,7 +169,7 @@ match = app_commands.Group(name="match", description="match utilities")
 @match.command(name="thread", description="create a private match thread for the two teams in a match.")
 @app_commands.describe(
     tournament_id="tournament ID",
-    match_id="match id as shown when the round was created"
+    match_id="match ID"
 )
 async def match_thread(
     inter: discord.Interaction,
@@ -319,14 +319,90 @@ async def match_thread(
 
 # /match poke <match_id> [time|standard] TODO
 
-# /match settime <match_id> <YYYY-MM-DD HH:MM> TODO
+# /match settime <tournament_id> <match_id> <YYYY-MM-DD HH:MM>
+@match.command(
+    name="settime",
+    description="set (or update) the scheduled start time for a match."
+)
+@app_commands.describe(
+    tournament_id="tournament ID",
+    match_id="match ID",
+    when="date/time in 24h format: YYYY-MM-DD HH:MM"
+)
+async def match_settime(
+    inter: discord.Interaction,
+    tournament_id: str,
+    match_id: int,
+    when: str
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms,", ephemeral=True)
+
+    if not get_settings(tournament_id):
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+
+    m = get_match(tournament_id, match_id)
+    if not m:
+        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
+
+    # parse time input
+    try:
+        dt = datetime.strptime(when, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return await inter.response.send_message(
+            "invalid time. use **YYYY-MM-DD HH:MM** (24h).",
+            ephemeral=True
+        )
+
+    # save to db
+    set_match_time(tournament_id, match_id, dt.strftime("%Y-%m-%d %H:%M"))
+
+    # format
+    pretty = f"{dt.strftime('%B')} {dt.day}, {dt.strftime('%A')} at {dt.strftime('%I:%M%p').lstrip('0')}"
+
+    # announce in thread (if exists)
+    posted_update = False
+    mentioned = False
+    try:
+        a_id, b_id = m.get("team_a_role_id"), m.get("team_b_role_id")
+        a_mention = f"<@&{a_id}>" if a_id else ""
+        b_mention = f"<@&{b_id}>" if b_id else ""
+        mention_text = f"{a_mention} {b_mention}".strip()
+
+        thread_id = m.get("thread_id")
+        if thread_id and inter.guild:
+            thread = inter.guild.get_thread(thread_id)
+            if thread:
+                await thread.send(
+                    f"{mention_text}\n🕑 match date/time updated: **{pretty}**",
+                    allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
+                )
+                posted_update = True
+                mentioned = True
+    except Exception:
+        pass
+
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title="match time set",
+            description="\n".join([
+                f"**match:** #{match_id}",
+                f"**time:** {pretty}",
+                ("_update posted and teams pinged in thread_" if mentioned else
+                 "_update posted in thread (no pings)_" if posted_update else
+                 "_no thread to update_")
+            ]),
+            color=0xB54882
+        ),
+        ephemeral=True
+    )
 
 
 # /match report <tournament_id> <match_id> <score_a> <score_b>
 @match.command(name="report", description="report a match score")
 @app_commands.describe(
     tournament_id="tournament ID",
-    match_id="match id as shown when the round was created",
+    match_id="match ID",
     score_a="maps for team A",
     score_b="maps for team B"
 )
@@ -382,7 +458,7 @@ async def match_add(
         base_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
     except ValueError:
         return await inter.response.send_message(
-            "invalid `start_time` format. use `YYYY-MM-DD HH:MM` (e.g., `2025-10-10 20:00`).",
+            "invalid `start_time` format. use `YYYY-MM-DD HH:MM`",
             ephemeral=True
         )
 
