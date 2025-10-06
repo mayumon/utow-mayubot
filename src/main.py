@@ -689,19 +689,15 @@ async def tournament_list(inter: discord.Interaction, slug: str):
     from datetime import datetime
 
     def fmt_when(s: str | None) -> str | None:
+        """Pretty date like: [October 17th, 2025 at 8:00PM]"""
         if not s:
             return None
-
-        # expects "YYYY-MM-DD HH:MM"
         try:
             dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
             month = dt.strftime("%B")
             day = ordinal(dt.day)
             year = dt.year
-            time12 = dt.strftime("%I:%M%p").lstrip("0") if hasattr(dt, "strftime") else dt.strftime("%I:%M%p").lstrip("0")
-
-            if time12.startswith("0"):
-                time12 = time12[1:]
+            time12 = dt.strftime("%I:%M%p").lstrip("0")
             return f"[{month} {day}, {year} at {time12}]"
         except Exception:
             return f"[{s}]"
@@ -738,10 +734,7 @@ async def tournament_list(inter: discord.Interaction, slug: str):
             sa = r["score_a"]
             sb = r["score_b"]
 
-            if r["reported"] and sa is not None and sb is not None:
-                score_text = f"{sa}-{sb}"
-            else:
-                score_text = "_ - _"
+            score_text = f"{sa}-{sb}" if r["reported"] and sa is not None and sb is not None else "_ - _"
 
             top_line = f"☆ match #{r['match_id']}:\n{a} vs {b} ━ score: {score_text}"
             when_line = fmt_when(r["start_time_local"])
@@ -766,7 +759,7 @@ async def tournament_list(inter: discord.Interaction, slug: str):
 
     await inter.response.send_message(embed=embeds[0], ephemeral=True)
     for e in embeds[1:]:
-        await inter.followup.send(embed=e, ephemeral=False)
+        await inter.followup.send(embed=e, ephemeral=True)
 
 
 # /tournament standings TODO
