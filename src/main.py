@@ -385,7 +385,7 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
     phase = (m.get("phase") or "").lower()
     round_no = m.get("round_no")
     prefix = _phase_prefix(phase, round_no)
-    base_title = f"{prefix}: {a_role.name} vs {b_role.name}"
+    base_title = f"{prefix}: match #{match_id} ━ {a_role.name} vs {b_role.name}"
     title = base_title[:100]
 
     # create thread

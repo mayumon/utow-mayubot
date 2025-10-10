@@ -53,11 +53,6 @@ CREATE TABLE IF NOT EXISTS matches (
     PRIMARY KEY (tournament_name, match_id)
 );
 
-CREATE TABLE IF NOT EXISTS swiss_meta (
-    tournament_name  TEXT PRIMARY KEY REFERENCES settings(tournament_name),
-    rounds          INTEGER NOT NULL
-);
-
 -- Reminders
 CREATE TABLE IF NOT EXISTS reminders (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,8 +85,11 @@ CREATE INDEX IF NOT EXISTS idx_matches_phase_round_bracket
   ON matches(tournament_name, phase, round_no, bracket);
 
 """
+
+
 class TeamIdInUseError(Exception):
     pass
+
 
 @contextmanager
 def connect():
@@ -168,20 +166,18 @@ def link_team(
     tournament_name: str,
     team_role_id: int,
     team_id: Optional[int] = None,
-    display_name: Optional[str] = None
 ) -> int:
     assigned_id = team_id if team_id is not None else _next_team_id(tournament_name)
     try:
         with connect() as con:
             cur = con.cursor()
             cur.execute(
-                "INSERT INTO teams(team_role_id, team_id, display_name, tournament_name) "
-                "VALUES(?, ?, ?, ?) "
+                "INSERT INTO teams(team_role_id, team_id, tournament_name) "
+                "VALUES(?, ?, ?) "
                 "ON CONFLICT(team_role_id) DO UPDATE SET "
                 "  team_id=excluded.team_id, "
-                "  display_name=COALESCE(excluded.display_name, teams.display_name), "
                 "  tournament_name=excluded.tournament_name",
-                (team_role_id, assigned_id, display_name, tournament_name),
+                (team_role_id, assigned_id, tournament_name),
             )
             return assigned_id
     except sqlite3.IntegrityError as e:
@@ -198,15 +194,19 @@ def unlink_team(team_role_id: int) -> None:
 def list_teams(tournament_name: str) -> list[dict[str, Any]]:
     with connect() as con:
         cur = con.cursor()
-        cur.execute("SELECT team_role_id, team_id, display_name FROM teams WHERE tournament_name=? ORDER BY display_name ",
-                    (tournament_name,),)
+        cur.execute("""
+            SELECT team_role_id, team_id
+            FROM teams
+            WHERE tournament_name=?
+            ORDER BY team_id
+        """, (tournament_name,))
         return [dict(r) for r in cur.fetchall()]
 
 
 def get_team_by_role(team_role_id: int) -> Optional[dict[str, Any]]:
     with connect() as con:
         cur = con.cursor()
-        cur.execute("SELECT team_role_id, team_id, display_name, tournament_name FROM teams WHERE team_role_id=? ",
+        cur.execute("SELECT team_role_id, team_id, tournament_name FROM teams WHERE team_role_id=? ",
                 (team_role_id,),)
         row = cur.fetchone()
         return dict(row) if row else None
@@ -215,7 +215,7 @@ def get_team_by_role(team_role_id: int) -> Optional[dict[str, Any]]:
 def get_team_by_participant(tournament_name: str, team_id: int) -> Optional[dict[str, Any]]:
     with connect() as con:
         cur = con.cursor()
-        cur.execute("SELECT team_role_id, team_id, display_name FROM teams WHERE tournament_name=? AND team_id=? ",
+        cur.execute("SELECT team_role_id, team_id FROM teams WHERE tournament_name=? AND team_id=? ",
                     (tournament_name, team_id),)
         row = cur.fetchone()
         return dict(row) if row else None
@@ -223,7 +223,7 @@ def get_team_by_participant(tournament_name: str, team_id: int) -> Optional[dict
 
 # ------------ matches ------------
 
-# set clear_poke = True to drop active poke JSON when overwriting times
+# set clear_poke = true to drop active poke when overwriting times
 def upsert_match(tournament_name: str,
                 match_id: int,
                 *,
@@ -231,7 +231,6 @@ def upsert_match(tournament_name: str,
                 thread_id: Optional[int] = None,
                 clear_poke: bool = False,) -> None:
     with connect() as con:
-        # dynamic update list to avoid overwriting with NULLs
         sets = []
         args: list[Any] = []
 
@@ -269,7 +268,7 @@ def set_thread(tournament_name: str, match_id: int, thread_id: int) -> None:
     upsert_match(tournament_name, match_id, thread_id=thread_id)
 
 
-# save or clear the active poke json for a match
+# save or clear the active poke for a match
 def save_active_poke(tournament_name: str, match_id: int, poke_payload: dict[str, Any] | None) -> None:
     with connect() as con:
         if poke_payload is None:
@@ -317,7 +316,6 @@ def list_matches(tournament_name: str, with_time_only: bool = False) -> list[dic
 
 
 # create a swiss round with pairings
-# pairings: list[dict]: {"match_id": int, "team_a_role_id": int, "team_b_role_id": int, "start_time_local": Optional[str]}
 def create_round(slug: str, round_no: int, pairings: list[dict], phase: str) -> list[int]:
     assigned_ids: list[int] = []
     with connect() as con:
@@ -490,7 +488,6 @@ def list_round_placeholders(slug: str, round_no: int, phase: str) -> list[int]:
 
 
 def assign_pairs_into_round(slug: str, round_no: int, pairs: list[tuple[int, int]], phase: str) -> None:
-
     with connect() as con:
         cur = con.cursor()
         cur.execute("""
@@ -511,25 +508,7 @@ def assign_pairs_into_round(slug: str, round_no: int, pairs: list[tuple[int, int
             """, (a, b, slug, mid, phase, round_no))
 
 
-def get_team_display_map(slug: str) -> dict[int, str]:
-    """role_id -> display label (display_name if present, else @role mention placeholder)."""
-    with connect() as con:
-        cur = con.cursor()
-        cur.execute("""
-            SELECT team_role_id, COALESCE(NULLIF(TRIM(display_name), ''), NULL) AS dn
-            FROM teams
-            WHERE tournament_name=?
-        """, (slug,))
-        out = {}
-        for r in cur.fetchall():
-            rid = int(r["team_role_id"])
-            dn = r["dn"]
-            out[rid] = dn if dn else f"<@&{rid}>"
-        return out
-
-
 def list_all_matches_full(slug: str) -> list[dict]:
-    """All matches for a tournament with phase/round and core fields."""
     with connect() as con:
         cur = con.cursor()
         cur.execute("""
@@ -554,6 +533,7 @@ def list_all_matches_full(slug: str) -> list[dict]:
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
+
 def _parse_local(start_time_local: str, tz_str: str) -> datetime:
     # start_time_local: "YYYY-MM-DD HH:MM" (naive, stored as local)
     naive = datetime.strptime(start_time_local, "%Y-%m-%d %H:%M")
@@ -561,7 +541,6 @@ def _parse_local(start_time_local: str, tz_str: str) -> datetime:
 
 
 def schedule_match_reminders(slug: str, match_id: int) -> int:
-
     # load match + tz
     with connect() as con:
         cur = con.cursor()
@@ -724,16 +703,7 @@ class MatchUpdateError(Exception):
     pass
 
 
-# storage.py
-class MatchUpdateError(Exception):
-    pass
-
-
 def record_result(slug: str, match_id: int, score_a: int, score_b: int) -> None:
-    """
-    Write scores and mark reported. Standings are computed from matches,
-    so we don't maintain per-team counters anymore.
-    """
     with connect() as con:
         cur = con.cursor()
 
@@ -769,10 +739,6 @@ def record_result(slug: str, match_id: int, score_a: int, score_b: int) -> None:
 
 
 def compute_standings(slug: str, *, phase: str | None = None) -> list[dict]:
-    """
-    Primary: match wins
-    Tiebreaks: map differential, map wins, team_id
-    """
     with connect() as con:
         cur = con.cursor()
         sql = f"""
@@ -832,6 +798,7 @@ def compute_standings(slug: str, *, phase: str | None = None) -> list[dict]:
     # sort: wins DESC, map diff DESC, map wins DESC, team_id ASC
     rows.sort(key=lambda r: (-r["wins"], -r["md"], -r["map_wins"], r["team_id_for_tiebreak"]))
     return rows
+
 
 def ranked_team_ids(slug: str, *, phase: str | None = None) -> list[int]:
     rows = compute_standings(slug, phase=phase)
