@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS teams (
     team_id  INTEGER NOT NULL,
     display_name       TEXT,
     
+    match_wins         INTEGER NOT NULL DEFAULT 0,
+    match_losses       INTEGER NOT NULL DEFAULT 0,
+    map_wins           INTEGER NOT NULL DEFAULT 0,
+    map_losses         INTEGER NOT NULL DEFAULT 0,
+    
     tournament_name     TEXT NOT NULL REFERENCES settings(tournament_name) ON DELETE CASCADE,
     UNIQUE(tournament_name, team_id)
 );
@@ -67,6 +72,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     when_utc         TEXT NOT NULL,
     kind             TEXT NOT NULL,
     sent             INTEGER DEFAULT 0,
+    retry_count      INTEGER DEFAULT 0,
     FOREIGN KEY (tournament_name, match_id)
       REFERENCES matches(tournament_name, match_id) ON DELETE CASCADE,
     UNIQUE (tournament_name, match_id, kind)
@@ -173,11 +179,10 @@ def link_team(
     Upsert a role -> team mapping. If team_id is None, auto-assign the next team_id for this tournament.
     Returns the team_id actually stored.
     """
+    assigned_id = team_id if team_id is not None else _next_team_id(tournament_name)
     try:
         with connect() as con:
-            cur = con.cursor()  # <-- you had cur = con.cursor (missing parentheses)
-            # Decide the id
-            assigned_id = team_id if team_id is not None else _next_team_id(tournament_name)
+            cur = con.cursor()
 
             cur.execute(
                 "INSERT INTO teams(team_role_id, team_id, display_name, tournament_name) "
@@ -190,11 +195,9 @@ def link_team(
             )
             return assigned_id
     except sqlite3.IntegrityError as e:
-        # UNIQUE(tournament_name, team_id) collision
         raise TeamIdInUseError(
-            f"Team id {team_id} is already mapped in tournament {tournament_name}"
+            f"Team id {assigned_id} is already mapped in tournament {tournament_name}"
         ) from e
-
 
 
 def unlink_team(team_role_id: int) -> None:
@@ -388,7 +391,6 @@ def create_round(slug: str, round_no: int, pairings: list[dict], phase: str) -> 
     return assigned_ids
 
 
-
 def list_round_matches(slug: str, round_no: int, phase: str) -> list[dict]:
     with connect() as con:
         cur = con.cursor()
@@ -399,14 +401,6 @@ def list_round_matches(slug: str, round_no: int, phase: str) -> list[dict]:
             (slug, phase, round_no),
         )
         return [dict(r) for r in cur.fetchall()]
-
-
-def record_result(slug: str, match_id: int, score_a: int, score_b: int) -> None:
-    with connect() as con:
-        con.execute(
-            "UPDATE matches SET score_a=?, score_b=?, reported=1 WHERE tournament_name=? AND match_id=?",
-            (score_a, score_b, slug, match_id),
-        )
 
 
 def swiss_history(slug: str) -> list[dict]:
@@ -759,3 +753,77 @@ def schedule_all_match_reminders(slug: str) -> tuple[int, int]:
             matches_updated += 1
             reminders_total += n
     return matches_updated, reminders_total
+
+
+class MatchUpdateError(Exception):
+    pass
+
+
+def record_result_and_update_team_records(slug: str, match_id: int, score_a: int, score_b: int) -> None:
+    """
+    Atomically:
+      - undo previous W/L from this match (if it was reported and not a tie),
+      - set the new score (reported=1),
+      - apply new W/L to teams (if not a tie).
+
+    Raises MatchUpdateError with a friendly message on problems (e.g., teams not assigned/mapped).
+    """
+    with connect() as con:
+        cur = con.cursor()
+
+        # fetch match + teams
+        cur.execute("""
+            SELECT team_a_role_id AS a_id, team_b_role_id AS b_id,
+                   score_a AS old_a, score_b AS old_b, reported
+            FROM matches
+            WHERE tournament_name=? AND match_id=?
+        """, (slug, match_id))
+        row = cur.fetchone()
+        if not row:
+            raise MatchUpdateError(f"match #{match_id} not found")
+
+        a_id = row["a_id"]; b_id = row["b_id"]
+        if a_id is None or b_id is None:
+            raise MatchUpdateError("both teams must be assigned before reporting")
+
+        # ensure both teams exist in this tournament's mapping
+        cur.execute("""
+            SELECT COUNT(*) AS c
+            FROM teams
+            WHERE tournament_name=? AND team_role_id IN (?,?)
+        """, (slug, a_id, b_id))
+        if int(cur.fetchone()["c"]) != 2:
+            raise MatchUpdateError("one or both teams are not mapped to this tournament")
+
+        # 1) undo old result (if previously reported and not a tie)
+        if int(row["reported"] or 0) == 1 and row["old_a"] is not None and row["old_b"] is not None and row["old_a"] != row["old_b"]:
+            old_winner = a_id if row["old_a"] > row["old_b"] else b_id
+            old_loser  = b_id if row["old_a"] > row["old_b"] else a_id
+            cur.execute("""
+                UPDATE teams SET match_wins = MAX(match_wins - 1, 0)
+                WHERE tournament_name=? AND team_role_id=?
+            """, (slug, old_winner))
+            cur.execute("""
+                UPDATE teams SET match_losses = MAX(match_losses - 1, 0)
+                WHERE tournament_name=? AND team_role_id=?
+            """, (slug, old_loser))
+
+        # 2) write new result
+        cur.execute("""
+            UPDATE matches
+            SET score_a=?, score_b=?, reported=1
+            WHERE tournament_name=? AND match_id=?
+        """, (score_a, score_b, slug, match_id))
+
+        # 3) apply new W/L if not a tie
+        if score_a != score_b:
+            winner = a_id if score_a > score_b else b_id
+            loser  = b_id if score_a > score_b else a_id
+            cur.execute("""
+                UPDATE teams SET match_wins = match_wins + 1
+                WHERE tournament_name=? AND team_role_id=?
+            """, (slug, winner))
+            cur.execute("""
+                UPDATE teams SET match_losses = match_losses + 1
+                WHERE tournament_name=? AND team_role_id=?
+            """, (slug, loser))

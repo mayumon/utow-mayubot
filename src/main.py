@@ -15,6 +15,7 @@ import asyncio
 # initialize bot
 intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 log = logging.getLogger("reminders")
@@ -30,7 +31,7 @@ async def on_ready():
     except Exception as e:
         print(f"❌ sync failed: {e}")
 
-    asyncio.create_task(reminder_worker(bot))
+    await asyncio.create_task(reminder_worker(bot))
 
 
 # ------------------------ diagnostics ------------------------
@@ -725,15 +726,33 @@ async def match_report(inter: discord.Interaction, tournament_id: str, match_id:
 
     m = get_match(tournament_id, match_id)
     if not m:
-        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.",
-                                                 ephemeral=True)
+        return await inter.response.send_message(
+            f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True
+        )
 
-    record_result(tournament_id, match_id, score_a, score_b)
-
+    # guard: both teams assigned
     a = m.get("team_a_role_id")
     b = m.get("team_b_role_id")
-    label = f"<@&{a}> vs <@&{b}>" if a and b else f"match #{match_id}"
-    await inter.response.send_message(f"recorded result for {label}: **{score_a}–{score_b}**.", ephemeral=True)
+    if not a or not b:
+        return await inter.response.send_message(
+            "cannot report yet: this match does not have both teams assigned.", ephemeral=True
+        )
+
+    # write scores + update team records atomically
+    try:
+        record_result_and_update_team_records(tournament_id, match_id, score_a, score_b)
+    except MatchUpdateError as e:
+        return await inter.response.send_message(f"couldn't record result: {e}", ephemeral=True)
+    except Exception as e:
+        # unexpected error path
+        return await inter.response.send_message(f"error recording result: {e}", ephemeral=True)
+
+    label = f"<@&{a}> vs <@&{b}>"
+    tie_note = " (tie - no W/L changes)" if score_a == score_b else ""
+    await inter.response.send_message(
+        f"recorded result for {label}: **{score_a}–{score_b}**{tie_note}.",
+        ephemeral=True
+    )
 
 
 # /match add <tournament_id> <swiss|double_elim|roundrobin> [rounds] <start_time>
@@ -1425,48 +1444,42 @@ async def tournament_refresh(
 
         next_round = latest + 1
         if not round_exists(tournament_id, next_round, phase):
-            results.append(f"DE: round {next_round} doesn't exist. Create placeholders with `/match add kind:double_elim`.")
+            results.append(
+                f"DE: round {next_round} doesn't exist. Create placeholders with `/match add kind:double_elim`.")
             return
-        if not round_has_placeholders(tournament_id, next_round, phase):
+
+        # Pull placeholders (both teams NULL) and group by bracket tag
+        nr_matches = list_round_matches(tournament_id, next_round, phase)
+        placeholders = [r for r in nr_matches if r.get("team_a_role_id") is None and r.get("team_b_role_id") is None]
+        if not placeholders:
             results.append(f"DE: round {next_round} has no empty placeholders.")
             return
+
+        from collections import defaultdict
+        mids_by_br: dict[str, list[int]] = defaultdict(list)
+        for r in sorted(placeholders, key=lambda x: x["match_id"]):
+            br = (r.get("bracket") or "").upper()
+            mids_by_br[br].append(int(r["match_id"]))
 
         latest_matches = list_round_matches(tournament_id, latest, phase)
         if not latest_matches:
             results.append(f"DE: no matches found for round {latest}.")
             return
 
+        # Helpers
+        def to_pairs(seq: list[int]) -> list[tuple[int, int]]:
+            buf = seq[:]
+            out: list[tuple[int, int]] = []
+            while len(buf) >= 2:
+                out.append((buf.pop(0), buf.pop(0)))
+            return out
+
+        # Gather winners/losers from the latest round, per bracket
         wb_winners: list[int] = []
-        wb_losers:  list[int] = []
+        wb_losers: list[int] = []
         lb_winners: list[int] = []
-
-        if n == 6 and latest == 1:
-            # seeds (team_id ascending)
-            rows = list_teams(tournament_id)
-            rows.sort(key=lambda r: int(r["team_id"]))
-            seed1 = int(rows[0]["team_role_id"])
-            seed2 = int(rows[1]["team_role_id"])
-
-            # winners of LCQ (two teams)
-            if len(wb_winners) != 2:
-                results.append("DE: need both LCQ winners reported to seed round 2.")
-                return
-
-            # ensure order: winner of LCQ#1 vs seed1, winner of LCQ#2 vs seed2
-            wb_pairs = [(wb_winners[0], seed1), (wb_winners[1], seed2)]
-            lb_pairs = []  # none in R2 for 6-team template
-
-            # rebuild assign_pairs according to placeholder order
-            nr_matches = list_round_matches(tournament_id, next_round, phase)
-            slots = [r for r in nr_matches if r.get("team_a_role_id") is None and r.get("team_b_role_id") is None]
-            mids_in_order = [int(r["match_id"]) for r in sorted(slots, key=lambda x: x["match_id"])]
-            mid_to_bracket = {int(r["match_id"]): (r.get("bracket") or "").upper() for r in slots}
-
-            q = {"WB": wb_pairs[:], "LB": []}
-            assign_pairs = []
-            for mid in mids_in_order:
-                br = mid_to_bracket.get(mid, "WB")
-                assign_pairs.append(q[br].pop(0) if q.get(br) else (None, None))
+        lb_losers: list[int] = []
+        lcq_winners: list[int] = []
 
         for m in sorted(latest_matches, key=lambda x: x["match_id"]):
             sa, sb = m.get("score_a"), m.get("score_b")
@@ -1477,62 +1490,98 @@ async def tournament_refresh(
                 continue
 
             winner = a if sa > sb else b
-            loser  = b if sa > sb else a
-            bracket = (m.get("bracket") or "").upper()
+            loser = b if sa > sb else a
+            br = (m.get("bracket") or "").upper()
 
-            if bracket == "LB":
+            if br == "LB":
                 lb_winners.append(winner)
-            else:
+                lb_losers.append(loser)
+            elif br == "LCQ":
+                lcq_winners.append(winner)
+                # LCQ losers are eliminated in our 6-team template, don't feed LB here
+            else:  # default WB
                 wb_winners.append(winner)
                 wb_losers.append(loser)
 
-        # Figure out NEXT-ROUND placeholder slots by bracket, preserving DB order
-        nr_matches = list_round_matches(tournament_id, next_round, phase)
-        # Only placeholders (both teams NULL)
-        nr_placeholders = [r for r in nr_matches if r.get("team_a_role_id") is None and r.get("team_b_role_id") is None]
-        if not nr_placeholders:
-            results.append(f"DE: round {next_round} has no placeholders after filtering.")
+        # Number of mapped teams drives a few special rules
+        n = len(list_teams(tournament_id))
+
+        # Build concrete assignments: list of (mid, a, b)
+        updates: list[tuple[int, int, int]] = []
+
+        # ---- 6-team Round 2 special seeding: LCQ winners vs seeds #1/#2
+        if n == 6 and latest == 1 and "WB" in mids_by_br and len(mids_by_br["WB"]) >= 2:
+            rows = list_teams(tournament_id)
+            rows.sort(key=lambda r: int(r["team_id"]))  # seed order 1..N by team_id
+            seed1 = int(rows[0]["team_role_id"])
+            seed2 = int(rows[1]["team_role_id"])
+            if len(lcq_winners) == 2:
+                wb_order = mids_by_br["WB"]
+                pairs = [(lcq_winners[0], seed1), (lcq_winners[1], seed2)]
+                for mid, (a, b) in zip(wb_order[:2], pairs):
+                    updates.append((mid, a, b))
+                # consume the two WB mids we just filled
+                mids_by_br["WB"] = wb_order[2:]
+
+        # ---- Generic WB for other cases: winners of latest WB pair among themselves
+        if "WB" in mids_by_br and mids_by_br["WB"]:
+            wb_pairs = to_pairs(wb_winners)
+            for mid, (a, b) in zip(mids_by_br["WB"], wb_pairs):
+                updates.append((mid, a, b))
+
+        # ---- LB next round: losers from latest WB + winners from latest LB
+        if "LB" in mids_by_br and mids_by_br["LB"]:
+            lb_feed = wb_losers + lb_winners
+            lb_pairs = to_pairs(lb_feed)
+            for mid, (a, b) in zip(mids_by_br["LB"], lb_pairs):
+                updates.append((mid, a, b))
+
+        # ---- 4P (8-team, Round 3): losers of the two WB semis
+        if "4P" in mids_by_br and mids_by_br["4P"]:
+            fourp_pairs = to_pairs(wb_losers)
+            for mid, (a, b) in zip(mids_by_br["4P"], fourp_pairs):
+                updates.append((mid, a, b))
+
+        # ---- 3P (6-team, Round 4): loser(WB final) vs loser(LB final) from latest
+        if "3P" in mids_by_br and mids_by_br["3P"]:
+            threep_pairs = to_pairs(wb_losers + lb_losers)
+            for mid, (a, b) in zip(mids_by_br["3P"], threep_pairs):
+                updates.append((mid, a, b))
+
+        # ---- GF:
+        # 4-team R4 and 6-team R4 → winner(WB final) vs winner(LB final) are both from latest
+        if "GF" in mids_by_br and mids_by_br["GF"]:
+            can_fill_gf = False
+            gf_pair: tuple[int, int] | None = None
+
+            if n in (4, 6):
+                if wb_winners and lb_winners:
+                    gf_pair = (wb_winners[0], lb_winners[0])
+                    can_fill_gf = True
+            elif n == 8:
+                # In our template GF is in R4 and depends on the R4 LB winner.
+                # We can’t fill it when latest=R3; leave TBD to avoid partials.
+                can_fill_gf = False
+
+            if can_fill_gf and gf_pair is not None:
+                updates.append((mids_by_br["GF"][0], gf_pair[0], gf_pair[1]))
+
+        if not updates:
+            results.append("DE: nothing to fill yet (waiting on more results).")
             return
 
-        mids_in_order = [int(r["match_id"]) for r in sorted(nr_placeholders, key=lambda x: x["match_id"])]
-        mid_to_bracket = {int(r["match_id"]): (r.get("bracket") or "").upper() for r in nr_placeholders}
+        # Persist: write only fully-known pairs so placeholders remain intact otherwise
+        for mid, a, b in updates:
+            set_match_teams(tournament_id, mid, team_a_role_id=a, team_b_role_id=b)
 
-        # Build WB/LB pairs from queues
-        def to_pairs(seq: list[int]) -> list[tuple[int|None, int|None]]:
-            buf = seq[:]
-            out: list[tuple[int|None, int|None]] = []
-            while len(buf) >= 2:
-                out.append((buf.pop(0), buf.pop(0)))
-            return out
+        # Pretty output
+        name_map = get_team_display_map(tournament_id)
 
-        wb_pairs = to_pairs(wb_winners)
-        lb_pairs = to_pairs(wb_losers + lb_winners)
+        def lab(x: int | None) -> str:
+            return name_map.get(x, f"<@&{x}>") if x else "TBD"
 
-        def pop_or_pad(br: str) -> tuple[int|None, int|None]:
-            if br == "WB":
-                return wb_pairs.pop(0) if wb_pairs else (None, None)
-            else:
-                return lb_pairs.pop(0) if lb_pairs else (None, None)
-
-        assign_pairs: list[tuple[int|None, int|None]] = []
-        for mid in mids_in_order:
-            br = mid_to_bracket.get(mid, "WB")
-            assign_pairs.append(pop_or_pad(br))
-
-        try:
-            assign_pairs_into_round(tournament_id, next_round, assign_pairs, phase)
-        except ValueError as e:
-            results.append(f"DE: {e}")
-            return
-
-        # pretty output
-        out_lines: list[str] = []
-        for mid, (a, b) in zip(mids_in_order, assign_pairs):
-            la = f"<@&{a}>" if a else "TBD"
-            lb = f"<@&{b}>" if b else "TBD"
-            out_lines.append(f"• {la} vs {lb}  (#{mid})")
-
-        results.append(f"double elim → round {next_round} filled:\n" + "\n".join(out_lines))
+        out_lines = [f"• #{mid}: {lab(a)} vs {lab(b)}" for (mid, a, b) in updates]
+        results.append(f"double elim → round {next_round} updates:\n" + "\n".join(out_lines))
 
     phases = (
         ["swiss", "double_elim"] if kind == "auto"
@@ -1564,7 +1613,7 @@ bot.tree.add_command(tournament)
 
 # /help TODO
 
-async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> bool:
+async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> tuple[bool, bool]:
     slug = payload["tournament_name"]
     mid = int(payload["match_id"])
     kind = payload["kind"]
@@ -1574,18 +1623,18 @@ async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> bool:
     s = get_settings(slug)
     if not s:
         log.warning(f"[reminders] settings missing for {slug}")
-        return False
+        return False, True
     tz = s.get("tz") or "America/Toronto"
 
     m = get_match(slug, mid)
     if not m:
         log.warning(f"[reminders] match #{mid} missing for {slug}")
-        return False
+        return False, True
 
     # MUST have an existing thread id; otherwise bail (no auto-create)
     if not thread_id:
         log.info(f"[reminders] match #{mid} has no thread_id; skipping.")
-        return False
+        return False, True
 
     # resolve thread from API/cache
     thread: discord.Thread | None = None
@@ -1595,20 +1644,20 @@ async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> bool:
             thread = ch
         else:
             log.info(f"[reminders] channel {thread_id} is not a Thread; skipping.")
-            return False
+            return False, True
     except discord.NotFound:
         log.info(f"[reminders] thread_id {thread_id} not found (maybe deleted); skipping.")
-        return False
+        return False, True
     except discord.Forbidden:
         log.warning(f"[reminders] forbidden fetching thread {thread_id}; skipping.")
-        return False
+        return False, True
     except Exception as e:
         log.exception(f"[reminders] error fetching thread {thread_id}: {e}")
-        return False
+        return False, False
 
     # join if needed
     try:
-        if isinstance(thread, discord.Thread) and thread.me is not None and not thread.me.joined:
+        if isinstance(thread, discord.Thread):
             await thread.join()
     except Exception:
         pass
@@ -1640,14 +1689,13 @@ async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> bool:
             allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
         )
         log.info(f"[reminders] posted {kind} for {slug} match #{mid} in thread {thread.id}")
-        return True
+        return True, True
     except discord.Forbidden:
         log.warning(f"[reminders] forbidden sending to thread {thread.id}")
-        return False
+        return False, True
     except Exception as e:
         log.exception(f"[reminders] error sending to thread {thread.id}: {e}")
-        return False
-
+        return False, False
 
 
 async def reminder_worker(bot: commands.Bot):
@@ -1660,10 +1708,10 @@ async def reminder_worker(bot: commands.Bot):
             if due:
                 log.info(f"[reminders] {len(due)} reminder(s) due at <= {now_utc.strftime('%Y-%m-%d %H:%M')}")
             for r in due:
-                ok = await _post_reminder_to_thread(bot, r)
-                if ok:
+                ok, final = await _post_reminder_to_thread(bot, r)
+                if ok or final:
                     mark_reminder_sent(int(r["id"]))
-                else:
+                if not ok:
                     log.info(f"[reminders] failed to deliver id={r['id']} ({r['kind']}) for match #{r['match_id']}")
         except Exception as e:
             log.exception(f"[reminders] worker loop error: {e}")
