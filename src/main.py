@@ -823,10 +823,7 @@ async def match_add(
         return schedule
 
     def seeded_team_ids_for_de(tournament_id: str) -> list[int]:
-        """Seeding = ascending team_id. Returns role_ids in seed order 1..N."""
-        rows = list_teams(tournament_id)
-        rows.sort(key=lambda r: int(r["team_id"]))
-        return [int(r["team_role_id"]) for r in rows]
+        return ranked_team_ids(tournament_id)
 
     def de_template_counts(num_teams: int, round_no: int) -> list[tuple[str, int]]:
         """
@@ -1502,16 +1499,12 @@ async def tournament_refresh(
 
         # ---- 6-team Round 2 special seeding: LCQ winners vs seeds #1/#2
         if n == 6 and latest == 1 and "WB" in mids_by_br and len(mids_by_br["WB"]) >= 2:
-            rows = list_teams(tournament_id)
-            rows.sort(key=lambda r: int(r["team_id"]))  # seed order 1..N by team_id
-            seed1 = int(rows[0]["team_role_id"])
-            seed2 = int(rows[1]["team_role_id"])
-            if len(lcq_winners) == 2:
+            seeds = ranked_team_ids(tournament_id)  # <-- all phases, all reported matches
+            if len(lcq_winners) == 2 and len(seeds) >= 2:
                 wb_order = mids_by_br["WB"]
-                pairs = [(lcq_winners[0], seed1), (lcq_winners[1], seed2)]
+                pairs = [(lcq_winners[0], seeds[0]), (lcq_winners[1], seeds[1])]
                 for mid, (a, b) in zip(wb_order[:2], pairs):
                     updates.append((mid, a, b))
-                # consume the two WB mids we just filled
                 mids_by_br["WB"] = wb_order[2:]
 
         # ---- Generic WB for other cases: winners of latest WB pair among themselves

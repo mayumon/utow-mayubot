@@ -172,24 +172,25 @@ def set_channels(tournament_name: str, announcements_ch: int, match_chats_ch: in
 def link_team(
     tournament_name: str,
     team_role_id: int,
-    team_id: Optional[int] = None
+    team_id: Optional[int] = None,
+    display_name: Optional[str] = None
 ) -> int:
     """
-    Upsert a role -> team mapping. If team_id is None, auto-assign the next team_id for this tournament.
+    Upsert a role -> team mapping. If team_id is None, auto-assign the next team_id.
     Returns the team_id actually stored.
     """
     assigned_id = team_id if team_id is not None else _next_team_id(tournament_name)
     try:
         with connect() as con:
             cur = con.cursor()
-
             cur.execute(
-                "INSERT INTO teams(team_role_id, team_id, tournament_name) "
+                "INSERT INTO teams(team_role_id, team_id, display_name, tournament_name) "
                 "VALUES(?, ?, ?, ?) "
                 "ON CONFLICT(team_role_id) DO UPDATE SET "
                 "  team_id=excluded.team_id, "
+                "  display_name=COALESCE(excluded.display_name, teams.display_name), "
                 "  tournament_name=excluded.tournament_name",
-                (team_role_id, assigned_id, tournament_name),
+                (team_role_id, assigned_id, display_name, tournament_name),
             )
             return assigned_id
     except sqlite3.IntegrityError as e:
@@ -825,3 +826,84 @@ def record_result_and_update_team_records(slug: str, match_id: int, score_a: int
                 UPDATE teams SET match_losses = match_losses + 1
                 WHERE tournament_name=? AND team_role_id=?
             """, (slug, loser))
+
+
+def compute_rankings(slug: str, *, phase: str | None = None) -> list[dict]:
+    """
+    Compute current rankings from reported matches, optionally restricted to a phase.
+    Sort: match wins DESC, map differential DESC, map_wins DESC, team_id ASC (stable).
+    Returns rows like:
+      {'team_role_id': int, 'wins': int, 'map_wins': int, 'map_losses': int, 'team_id_for_tiebreak': int}
+    """
+    with connect() as con:
+        cur = con.cursor()
+        sql = """
+            SELECT
+              t.team_role_id                 AS team_role_id,
+              COALESCE(SUM(
+                CASE
+                  WHEN m.reported=1 AND
+                       ((m.team_a_role_id=t.team_role_id AND m.score_a>m.score_b) OR
+                        (m.team_b_role_id=t.team_role_id AND m.score_b>m.score_a))
+                  THEN 1 ELSE 0
+                END
+              ), 0)                          AS wins,
+              COALESCE(SUM(CASE
+                  WHEN m.reported=1 AND m.team_a_role_id=t.team_role_id THEN m.score_a
+                  WHEN m.reported=1 AND m.team_b_role_id=t.team_role_id THEN m.score_b
+                  ELSE 0 END), 0)            AS map_wins,
+              COALESCE(SUM(CASE
+                  WHEN m.reported=1 AND m.team_a_role_id=t.team_role_id THEN m.score_b
+                  WHEN m.reported=1 AND m.team_b_role_id=t.team_role_id THEN m.score_a
+                  ELSE 0 END), 0)            AS map_losses,
+              MIN(t.team_id)                 AS team_id_for_tiebreak
+            FROM teams t
+            LEFT JOIN matches m
+              ON m.tournament_name=t.tournament_name
+             AND (m.team_a_role_id=t.team_role_id OR m.team_b_role_id=t.team_role_id)
+             AND m.reported=1
+             {phase_filter}
+            WHERE t.tournament_name=?
+            GROUP BY t.team_role_id
+        """
+        phase_filter = ""
+        args: list[object] = []
+        if phase:
+            phase_filter = "AND m.phase=?"
+            args.append(phase)
+        sql = sql.format(phase_filter=phase_filter)
+        args.append(slug)
+
+        cur.execute(sql, tuple(args))
+        rows = [dict(r) for r in cur.fetchall()]
+
+    # Normalize + sort
+    for r in rows:
+        r["team_role_id"] = int(r["team_role_id"])
+        r["wins"] = int(r["wins"])
+        r["map_wins"] = int(r["map_wins"])
+        r["map_losses"] = int(r["map_losses"])
+        r["team_id_for_tiebreak"] = int(r["team_id_for_tiebreak"]) if r["team_id_for_tiebreak"] is not None else 10**9
+
+    rows.sort(key=lambda r: (
+        -r["wins"],
+        -(r["map_wins"] - r["map_losses"]),
+        -r["map_wins"],
+        r["team_id_for_tiebreak"]
+    ))
+    return rows
+
+
+def ranked_team_ids(slug: str, *, phase: str | None = None) -> list[int]:
+    """
+    Returns team_role_ids sorted by current ranking (highest first).
+    If no reported matches yet, falls back to ascending team_id.
+    """
+    rows = compute_rankings(slug, phase=phase)
+    if rows:
+        return [r["team_role_id"] for r in rows]
+
+    # fallback: deterministic by team_id asc
+    teams = list_teams(slug)
+    teams.sort(key=lambda r: int(r["team_id"]))
+    return [int(r["team_role_id"]) for r in teams]
