@@ -97,7 +97,7 @@ async def setup_channels(inter: discord.Interaction,
 team = app_commands.Group(name="team", description="map/manage teams", parent=setup)
 
 
-# /setup team <@role>
+# /setup team add <@role>
 @team.command(name="add", description="map a discord team role (auto-assigns team id)")
 @app_commands.describe(
     tournament_id="tournament ID",
@@ -115,9 +115,8 @@ async def setup_team_add(
         return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.",
                                                  ephemeral=True)
 
-    name = role.name
     try:
-        assigned_id = link_team(tournament_id, team_role_id=role.id, team_id=None, display_name=name)
+        assigned_id = link_team(tournament_id, team_role_id=role.id, team_id=None)
     except TeamIdInUseError:
         return await inter.response.send_message(
             f"could not assign a unique team id for `{tournament_id}`. try again.",
@@ -131,7 +130,6 @@ async def setup_team_add(
                 f"**tournament ID:** `{tournament_id}`",
                 f"**role:** {role.mention} (`{role.id}`)",
                 f"**team ID:** `{assigned_id}`",
-                f"**display name:** `{name}`",
             ]),
             color=0xB54882
         ),
@@ -181,7 +179,6 @@ async def setup_team_remove(
         )
 
     rid = int(mapping["team_role_id"])
-    dn = mapping.get("display_name") or f"<@&{rid}>"
     tid = int(mapping["team_id"])
 
     # unlink
@@ -194,7 +191,6 @@ async def setup_team_remove(
                 f"**tournament:** `{tournament_id}`",
                 f"**role:** <@&{rid}> (`{rid}`)",
                 f"**team id:** `{tid}`",
-                f"**display name:** `{dn}`",
             ]),
             color=0xB54882
         ),
@@ -217,26 +213,21 @@ async def setup_team_list(inter: discord.Interaction, tournament_id: str):
     if not rows:
         return await inter.response.send_message(f"no teams mapped yet for `{tournament_id}`.", ephemeral=True)
 
-    # sort by team_id
-    rows.sort(key=lambda r: (int(r["team_id"]), (r["display_name"] or "").lower()))
+    plain_map = team_label_map(tournament_id, inter.guild, plain=True)
 
     lines = []
-    for r in rows:
+    for r in sorted(rows, key=lambda r: int(r["team_id"])):
         rid = int(r["team_role_id"])
         tid = int(r["team_id"])
-        dn = (r["display_name"] or "").strip()
-        label = dn if dn else f"<@&{rid}>"
+        label = plain_map.get(rid, f"role:{rid}")
         lines.append(f"• **{label}** - team_id `{tid}` - role <@&{rid}>")
 
-    embed = discord.Embed(
-        title=f"Teams - {tournament_id}",
-        color=0xB54882
-    )
+    embed = discord.Embed(title=f"Teams - {tournament_id}", color=0xB54882)
 
     chunk = []
     count = 0
     for i, line in enumerate(lines, 1):
-        chunk.append(line)
+        chunk.append(line);
         count += 1
         if count >= 20:
             embed.add_field(name="\u200b", value="\n".join(chunk), inline=False)
@@ -800,11 +791,13 @@ async def match_add(
         return await inter.response.send_message("need at least 2 mapped teams. map with `/setup team`.", ephemeral=True)
 
     # helper display
-    name_map = get_team_display_map(tournament_id)
+    name_map_plain = team_label_map(tournament_id, inter.guild, plain=True)
+
     def label(role_id: int | None) -> str:
         if role_id is None:
             return "BYE"
-        return name_map.get(role_id, f"role:{role_id}")
+        return name_map_plain.get(role_id, f"role:{role_id}")
+
     def gen_roundrobin_pairs(ids: list[int]) -> list[list[tuple[int | None, int | None]]]:
         players = ids[:]
         if len(players) % 2 == 1:
@@ -1063,21 +1056,18 @@ async def tournament_list(inter: discord.Interaction, slug: str):
     if not rows:
         return await inter.response.send_message(f"no matches found for `{slug}` yet.", ephemeral=True)
 
-    name_map = get_team_display_map(slug)
+    plain_map = team_label_map(slug, inter.guild, plain=True)
+    mention_map = team_label_map(slug, inter.guild, plain=False)
 
     def rr_bye_label(phase: str | None, a_id: int | None, b_id: int | None, *, mention: bool = False) -> tuple[
         str, str]:
-        """
-        Returns (a_label, b_label) with BYE handling for roundrobin.
-        If mention=True, only mention real teams; BYE is plain text.
-        """
         ph = (phase or "").lower()
         is_rr = ph == "roundrobin"
 
         def lbl(role_id: int | None) -> str:
             if role_id is None:
                 return "BYE" if is_rr else "TBD"
-            return (f"<@&{role_id}>" if mention else name_map.get(role_id, f"<@&{role_id}>"))
+            return (mention_map if mention else plain_map).get(role_id, f"<@&{role_id}>")
 
         return lbl(a_id), lbl(b_id)
 
@@ -1194,7 +1184,8 @@ async def tournament_announcement(inter: discord.Interaction, slug: str, post: b
     ann_ch_id = s.get("announcements_ch")
 
     # helpers
-    name_map = get_team_display_map(slug)
+    plain_map = team_label_map(slug, inter.guild, plain=True)
+    mention_map = team_label_map(slug, inter.guild, plain=False)
 
     def rr_bye_label(phase: str | None, a_id: int | None, b_id: int | None, *, mention: bool = False) -> tuple[
         str, str]:
@@ -1204,17 +1195,17 @@ async def tournament_announcement(inter: discord.Interaction, slug: str, post: b
         def lbl(role_id: int | None) -> str:
             if role_id is None:
                 return "BYE" if is_rr else "TBD"
-            return (f"<@&{role_id}>" if mention else name_map.get(role_id, f"<@&{role_id}>"))
+            return (mention_map if mention else plain_map).get(role_id, f"<@&{role_id}>")
 
         return lbl(a_id), lbl(b_id)
-
-    def phase_title(p: str) -> str:
-        return {"swiss": "swiss", "double_elim": "double elimination", "roundrobin": "round robin"}.get(p, p.title())
 
     def label(role_id: int | None) -> str:
         if role_id is None:
             return "TBD"
-        return name_map.get(role_id, f"<@&{role_id}>")
+        return plain_map.get(role_id, f"<@&{role_id}>")
+
+    def phase_title(p: str) -> str:
+        return {"swiss": "swiss", "double_elim": "double elimination", "roundrobin": "round robin"}.get(p, p.title())
 
     def ordinal(n: int) -> str:
         if 10 <= (n % 100) <= 20:
@@ -1575,10 +1566,10 @@ async def tournament_refresh(
             set_match_teams(tournament_id, mid, team_a_role_id=a, team_b_role_id=b)
 
         # Pretty output
-        name_map = get_team_display_map(tournament_id)
+        plain_map = team_label_map(tournament_id, inter.guild, plain=True)
 
         def lab(x: int | None) -> str:
-            return name_map.get(x, f"<@&{x}>") if x else "TBD"
+            return plain_map.get(x, f"<@&{x}>") if x else "TBD"
 
         out_lines = [f"• #{mid}: {lab(a)} vs {lab(b)}" for (mid, a, b) in updates]
         results.append(f"double elim → round {next_round} updates:\n" + "\n".join(out_lines))
@@ -1716,6 +1707,24 @@ async def reminder_worker(bot: commands.Bot):
         except Exception as e:
             log.exception(f"[reminders] worker loop error: {e}")
         await asyncio.sleep(60)
+
+
+def team_label_map(
+    slug: str,
+    guild: discord.Guild | None,
+    *,
+    plain: bool,            # true -> plain role.name; false -> role mention text
+) -> dict[int, str]:
+    rows = list_teams(slug)
+    out: dict[int, str] = {}
+    for r in rows:
+        rid = int(r["team_role_id"])
+        if plain and guild:
+            role = guild.get_role(rid)
+            out[rid] = role.name if role else f"role:{rid}"
+        else:
+            out[rid] = f"<@&{rid}>"
+    return out
 
 
 def run():

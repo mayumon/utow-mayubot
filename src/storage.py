@@ -172,8 +172,7 @@ def set_channels(tournament_name: str, announcements_ch: int, match_chats_ch: in
 def link_team(
     tournament_name: str,
     team_role_id: int,
-    team_id: Optional[int] = None,
-    display_name: Optional[str] = None
+    team_id: Optional[int] = None
 ) -> int:
     """
     Upsert a role -> team mapping. If team_id is None, auto-assign the next team_id for this tournament.
@@ -185,13 +184,12 @@ def link_team(
             cur = con.cursor()
 
             cur.execute(
-                "INSERT INTO teams(team_role_id, team_id, display_name, tournament_name) "
+                "INSERT INTO teams(team_role_id, team_id, tournament_name) "
                 "VALUES(?, ?, ?, ?) "
                 "ON CONFLICT(team_role_id) DO UPDATE SET "
                 "  team_id=excluded.team_id, "
-                "  display_name=excluded.display_name, "
                 "  tournament_name=excluded.tournament_name",
-                (team_role_id, assigned_id, display_name, tournament_name),
+                (team_role_id, assigned_id, tournament_name),
             )
             return assigned_id
     except sqlite3.IntegrityError as e:
