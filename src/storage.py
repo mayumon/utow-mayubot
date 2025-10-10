@@ -26,12 +26,6 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS teams (
     team_role_id       INTEGER PRIMARY KEY,
     team_id  INTEGER NOT NULL,
-    display_name       TEXT,
-    
-    match_wins         INTEGER NOT NULL DEFAULT 0,
-    match_losses       INTEGER NOT NULL DEFAULT 0,
-    map_wins           INTEGER NOT NULL DEFAULT 0,
-    map_losses         INTEGER NOT NULL DEFAULT 0,
     
     tournament_name     TEXT NOT NULL REFERENCES settings(tournament_name) ON DELETE CASCADE,
     UNIQUE(tournament_name, team_id)
@@ -73,6 +67,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     kind             TEXT NOT NULL,
     sent             INTEGER DEFAULT 0,
     retry_count      INTEGER DEFAULT 0,
+    
     FOREIGN KEY (tournament_name, match_id)
       REFERENCES matches(tournament_name, match_id) ON DELETE CASCADE,
     UNIQUE (tournament_name, match_id, kind)
@@ -175,10 +170,6 @@ def link_team(
     team_id: Optional[int] = None,
     display_name: Optional[str] = None
 ) -> int:
-    """
-    Upsert a role -> team mapping. If team_id is None, auto-assign the next team_id.
-    Returns the team_id actually stored.
-    """
     assigned_id = team_id if team_id is not None else _next_team_id(tournament_name)
     try:
         with connect() as con:
@@ -288,6 +279,7 @@ def save_active_poke(tournament_name: str, match_id: int, poke_payload: dict[str
             con.execute("UPDATE matches SET active_poke_json=? WHERE tournament_name=? AND match_id=? ",
                     (json.dumps(poke_payload, ensure_ascii=False), tournament_name, match_id),)
 
+
 def get_match(tournament_name: str, match_id: int) -> Optional[dict[str, Any]]:
     with connect() as con:
         cur = con.cursor()
@@ -309,8 +301,6 @@ def get_match(tournament_name: str, match_id: int) -> Optional[dict[str, Any]]:
         return d
 
 
-
-
 def list_matches(tournament_name: str, with_time_only: bool = False) -> list[dict[str, Any]]:
 
     with connect() as con:
@@ -326,32 +316,9 @@ def list_matches(tournament_name: str, with_time_only: bool = False) -> list[dic
         return [dict(r) for r in cur.fetchall()]
 
 
-# swiss
-def set_swiss_rounds(slug: str, rounds: int) -> None:
-    with connect() as con:
-        con.execute(
-            "INSERT INTO swiss_meta(tournament_name, rounds) VALUES(?, ?) "
-            "ON CONFLICT(tournament_name) DO UPDATE SET rounds=excluded.rounds",
-            (slug, rounds),
-        )
-
-
-def get_swiss_rounds(slug: str) -> Optional[int]:
-    with connect() as con:
-        cur = con.cursor()
-        cur.execute("SELECT rounds FROM swiss_meta WHERE tournament_name=?", (slug,))
-        row = cur.fetchone()
-        return int(row["rounds"]) if row else None
-
-
 # create a swiss round with pairings
 # pairings: list[dict]: {"match_id": int, "team_a_role_id": int, "team_b_role_id": int, "start_time_local": Optional[str]}
 def create_round(slug: str, round_no: int, pairings: list[dict], phase: str) -> list[int]:
-    """
-    Insert/upssert N matches for (slug, round_no, phase).
-    Each pairing may include: team_a_role_id, team_b_role_id, start_time_local, bracket (optional), match_id (optional).
-    Returns the assigned match_ids in order.
-    """
     assigned_ids: list[int] = []
     with connect() as con:
         cur = con.cursor()
@@ -459,7 +426,6 @@ def delete_unreported_round(slug: str, round_no: int, phase: str) -> int:
 
 
 def get_latest_fully_reported_round(slug: str, phase: str) -> Optional[int]:
-    """Return the highest round_no that is fully reported, or None if none."""
     with connect() as con:
         cur = con.cursor()
         cur.execute("""
@@ -758,22 +724,22 @@ class MatchUpdateError(Exception):
     pass
 
 
-def record_result_and_update_team_records(slug: str, match_id: int, score_a: int, score_b: int) -> None:
-    """
-    Atomically:
-      - undo previous W/L from this match (if it was reported and not a tie),
-      - set the new score (reported=1),
-      - apply new W/L to teams (if not a tie).
+# storage.py
+class MatchUpdateError(Exception):
+    pass
 
-    Raises MatchUpdateError with a friendly message on problems (e.g., teams not assigned/mapped).
+
+def record_result(slug: str, match_id: int, score_a: int, score_b: int) -> None:
+    """
+    Write scores and mark reported. Standings are computed from matches,
+    so we don't maintain per-team counters anymore.
     """
     with connect() as con:
         cur = con.cursor()
 
         # fetch match + teams
         cur.execute("""
-            SELECT team_a_role_id AS a_id, team_b_role_id AS b_id,
-                   score_a AS old_a, score_b AS old_b, reported
+            SELECT team_a_role_id AS a_id, team_b_role_id AS b_id
             FROM matches
             WHERE tournament_name=? AND match_id=?
         """, (slug, match_id))
@@ -781,11 +747,11 @@ def record_result_and_update_team_records(slug: str, match_id: int, score_a: int
         if not row:
             raise MatchUpdateError(f"match #{match_id} not found")
 
-        a_id = row["a_id"]; b_id = row["b_id"]
+        a_id, b_id = row["a_id"], row["b_id"]
         if a_id is None or b_id is None:
             raise MatchUpdateError("both teams must be assigned before reporting")
 
-        # ensure both teams exist in this tournament's mapping
+        # ensure both teams are mapped to this tournament
         cur.execute("""
             SELECT COUNT(*) AS c
             FROM teams
@@ -794,116 +760,85 @@ def record_result_and_update_team_records(slug: str, match_id: int, score_a: int
         if int(cur.fetchone()["c"]) != 2:
             raise MatchUpdateError("one or both teams are not mapped to this tournament")
 
-        # 1) undo old result (if previously reported and not a tie)
-        if int(row["reported"] or 0) == 1 and row["old_a"] is not None and row["old_b"] is not None and row["old_a"] != row["old_b"]:
-            old_winner = a_id if row["old_a"] > row["old_b"] else b_id
-            old_loser  = b_id if row["old_a"] > row["old_b"] else a_id
-            cur.execute("""
-                UPDATE teams SET match_wins = MAX(match_wins - 1, 0)
-                WHERE tournament_name=? AND team_role_id=?
-            """, (slug, old_winner))
-            cur.execute("""
-                UPDATE teams SET match_losses = MAX(match_losses - 1, 0)
-                WHERE tournament_name=? AND team_role_id=?
-            """, (slug, old_loser))
-
-        # 2) write new result
+        # write new result (overwrite if re-reported)
         cur.execute("""
             UPDATE matches
             SET score_a=?, score_b=?, reported=1
             WHERE tournament_name=? AND match_id=?
         """, (score_a, score_b, slug, match_id))
 
-        # 3) apply new W/L if not a tie
-        if score_a != score_b:
-            winner = a_id if score_a > score_b else b_id
-            loser  = b_id if score_a > score_b else a_id
-            cur.execute("""
-                UPDATE teams SET match_wins = match_wins + 1
-                WHERE tournament_name=? AND team_role_id=?
-            """, (slug, winner))
-            cur.execute("""
-                UPDATE teams SET match_losses = match_losses + 1
-                WHERE tournament_name=? AND team_role_id=?
-            """, (slug, loser))
 
-
-def compute_rankings(slug: str, *, phase: str | None = None) -> list[dict]:
+def compute_standings(slug: str, *, phase: str | None = None) -> list[dict]:
     """
-    Compute current rankings from reported matches, optionally restricted to a phase.
-    Sort: match wins DESC, map differential DESC, map_wins DESC, team_id ASC (stable).
-    Returns rows like:
-      {'team_role_id': int, 'wins': int, 'map_wins': int, 'map_losses': int, 'team_id_for_tiebreak': int}
+    Primary: match wins
+    Tiebreaks: map differential, map wins, team_id
     """
     with connect() as con:
         cur = con.cursor()
-        sql = """
+        sql = f"""
             SELECT
-              t.team_role_id                 AS team_role_id,
-              COALESCE(SUM(
-                CASE
-                  WHEN m.reported=1 AND
-                       ((m.team_a_role_id=t.team_role_id AND m.score_a>m.score_b) OR
-                        (m.team_b_role_id=t.team_role_id AND m.score_b>m.score_a))
-                  THEN 1 ELSE 0
-                END
-              ), 0)                          AS wins,
+              t.team_role_id AS team_role_id,
+
+              -- match wins / draws / losses from reported matches
               COALESCE(SUM(CASE
-                  WHEN m.reported=1 AND m.team_a_role_id=t.team_role_id THEN m.score_a
-                  WHEN m.reported=1 AND m.team_b_role_id=t.team_role_id THEN m.score_b
-                  ELSE 0 END), 0)            AS map_wins,
+                WHEN (m.team_a_role_id=t.team_role_id AND m.score_a>m.score_b) OR
+                     (m.team_b_role_id=t.team_role_id AND m.score_b>m.score_a)
+                THEN 1 ELSE 0 END), 0) AS wins,
+
               COALESCE(SUM(CASE
-                  WHEN m.reported=1 AND m.team_a_role_id=t.team_role_id THEN m.score_b
-                  WHEN m.reported=1 AND m.team_b_role_id=t.team_role_id THEN m.score_a
-                  ELSE 0 END), 0)            AS map_losses,
-              MIN(t.team_id)                 AS team_id_for_tiebreak
+                WHEN m.score_a = m.score_b THEN 1 ELSE 0 END), 0) AS draws,
+
+              COALESCE(SUM(CASE
+                WHEN (m.team_a_role_id=t.team_role_id AND m.score_a<m.score_b) OR
+                     (m.team_b_role_id=t.team_role_id AND m.score_b<m.score_a)
+                THEN 1 ELSE 0 END), 0) AS losses,
+
+              -- map totals for tiebreaks
+              COALESCE(SUM(CASE
+                WHEN m.team_a_role_id=t.team_role_id THEN m.score_a
+                WHEN m.team_b_role_id=t.team_role_id THEN m.score_b
+                ELSE 0 END), 0) AS map_wins,
+
+              COALESCE(SUM(CASE
+                WHEN m.team_a_role_id=t.team_role_id THEN m.score_b
+                WHEN m.team_b_role_id=t.team_role_id THEN m.score_a
+                ELSE 0 END), 0) AS map_losses,
+
+              MIN(t.team_id) AS team_id_for_tiebreak
+
             FROM teams t
             LEFT JOIN matches m
               ON m.tournament_name=t.tournament_name
              AND (m.team_a_role_id=t.team_role_id OR m.team_b_role_id=t.team_role_id)
              AND m.reported=1
-             {phase_filter}
+             {"AND m.phase=?" if phase else ""}
+
             WHERE t.tournament_name=?
             GROUP BY t.team_role_id
         """
-        phase_filter = ""
-        args: list[object] = []
-        if phase:
-            phase_filter = "AND m.phase=?"
-            args.append(phase)
-        sql = sql.format(phase_filter=phase_filter)
-        args.append(slug)
-
-        cur.execute(sql, tuple(args))
+        args = ([phase] if phase else []) + [slug]
+        cur.execute(sql, args)
         rows = [dict(r) for r in cur.fetchall()]
 
-    # Normalize + sort
     for r in rows:
         r["team_role_id"] = int(r["team_role_id"])
-        r["wins"] = int(r["wins"])
-        r["map_wins"] = int(r["map_wins"])
-        r["map_losses"] = int(r["map_losses"])
-        r["team_id_for_tiebreak"] = int(r["team_id_for_tiebreak"]) if r["team_id_for_tiebreak"] is not None else 10**9
+        for k in ("wins","draws","losses","map_wins","map_losses"):
+            r[k] = int(r[k])
+        r["md"] = r["map_wins"] - r["map_losses"]
+        r["team_id_for_tiebreak"] = (
+            int(r["team_id_for_tiebreak"]) if r["team_id_for_tiebreak"] is not None else 10**9
+        )
 
-    rows.sort(key=lambda r: (
-        -r["wins"],
-        -(r["map_wins"] - r["map_losses"]),
-        -r["map_wins"],
-        r["team_id_for_tiebreak"]
-    ))
+    # sort: wins DESC, map diff DESC, map wins DESC, team_id ASC
+    rows.sort(key=lambda r: (-r["wins"], -r["md"], -r["map_wins"], r["team_id_for_tiebreak"]))
     return rows
 
-
 def ranked_team_ids(slug: str, *, phase: str | None = None) -> list[int]:
-    """
-    Returns team_role_ids sorted by current ranking (highest first).
-    If no reported matches yet, falls back to ascending team_id.
-    """
-    rows = compute_rankings(slug, phase=phase)
+    rows = compute_standings(slug, phase=phase)
     if rows:
         return [r["team_role_id"] for r in rows]
 
-    # fallback: deterministic by team_id asc
+    # fallback
     teams = list_teams(slug)
     teams.sort(key=lambda r: int(r["team_id"]))
     return [int(r["team_role_id"]) for r in teams]
