@@ -561,7 +561,6 @@ def schedule_match_reminders(slug: str, match_id: int) -> int:
 
     # parse local start
     start_local = datetime.strptime(m["start_time_local"], "%Y-%m-%d %H:%M").replace(tzinfo=tzinfo)
-    start_utc = start_local.astimezone(safe_zoneinfo("UTC"))
     now_utc = _now_utc_naive()
     now_local = datetime.utcnow().replace(tzinfo=safe_zoneinfo("UTC")).astimezone(tzinfo)
 
@@ -569,9 +568,6 @@ def schedule_match_reminders(slug: str, match_id: int) -> int:
 
     pre1h_local = start_local - timedelta(hours=1)
     pre1h_utc = pre1h_local.astimezone(safe_zoneinfo("UTC"))
-
-    early_kind = None
-    early_dt_local = None
 
     if start_local.hour < 14:
         early_kind = "pre2h"
@@ -809,3 +805,16 @@ def ranked_team_ids(slug: str, *, phase: str | None = None) -> list[int]:
     teams = list_teams(slug)
     teams.sort(key=lambda r: int(r["team_id"]))
     return [int(r["team_role_id"]) for r in teams]
+
+
+def get_match_by_thread(thread_id: int) -> Optional[dict[str, Any]]:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT tournament_name, match_id, team_a_role_id, team_b_role_id,
+                   score_a, score_b, reported
+            FROM matches
+            WHERE thread_id=?
+        """, (thread_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None

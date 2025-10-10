@@ -557,37 +557,79 @@ async def match_setteam(inter: discord.Interaction, tournament_id: str, match_id
             color=0xB54882),ephemeral=True)
 
 
-# /match report <tournament_id> <match_id> <score_a> <score_b>
-@match.command(name="report", description="report a match score")
-@app_commands.describe(tournament_id="tournament ID", match_id="match ID", score_a="maps for team A",score_b="maps for team B")
-async def match_report(inter: discord.Interaction, tournament_id: str, match_id: int, score_a: int, score_b: int):
-    if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+# /match report (context-aware)
+@match.command(name="report",description="report a match score (in-thread for players; staff may pass IDs)")
+@app_commands.describe(score_a="maps for Team A",score_b="maps for Team B",
+                       tournament_id="(staff) tournament ID if not in the match thread",match_id="(staff) match ID if not in the match thread")
+async def match_report(inter: discord.Interaction,score_a: int,score_b: int,tournament_id: str | None = None,match_id: int | None = None,):
+    # basic validation
     if score_a < 0 or score_b < 0:
         return await inter.response.send_message("scores must be non-negative integers.", ephemeral=True)
 
-    m = get_match(tournament_id, match_id)
+    in_thread = isinstance(inter.channel, discord.Thread)
+    is_staff = staff_only(inter)
+
+    # not staff must be in a match thread
+    if not is_staff:
+        if tournament_id is not None or match_id is not None:
+            return await inter.response.send_message(
+                "players: use this *inside the match thread* :\n"
+                "`/match report <team_a_score> <team_b_score>`",
+                ephemeral=True,
+            )
+        if not in_thread:
+            return await inter.response.send_message(
+                "use this inside the match thread for your match.", ephemeral=True
+            )
+
+    # resolve the match:
+    m = None
+    slug = None
+    mid = None
+
+    if in_thread:
+        m = get_match_by_thread(inter.channel.id)
+        if m:
+            slug = m["tournament_name"]
+            mid = int(m["match_id"])
+
+    # if staff and not in thread, fall back to explicit IDs
+    if (slug is None or mid is None) and is_staff:
+        if tournament_id is None or match_id is None:
+            return await inter.response.send_message(
+                "staff usage outside a match thread: `/match report <a> <b> <tournament_id> <match_id>`",
+                ephemeral=True,
+            )
+        slug, mid = tournament_id, match_id
+        # load row for validation
+        m = get_match(slug, mid)
+
     if not m:
-        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
+        return await inter.response.send_message("couldn't resolve which match this is.", ephemeral=True)
 
     # guard: both teams assigned
     a = m.get("team_a_role_id")
     b = m.get("team_b_role_id")
     if not a or not b:
-        return await inter.response.send_message("cannot report yet: this match does not have both teams assigned.", ephemeral=True)
+        return await inter.response.send_message(
+            "cannot report yet: this match does not have both teams assigned.", ephemeral=True
+        )
 
     # write scores + update team records
     try:
-        record_result(tournament_id, match_id, score_a, score_b)
+        record_result(slug, mid, score_a, score_b)
     except MatchUpdateError as e:
         return await inter.response.send_message(f"couldn't record result: {e}", ephemeral=True)
     except Exception as e:
         return await inter.response.send_message(f"error recording result: {e}", ephemeral=True)
 
-    label = f"<@&{a}> vs <@&{b}>"
+    # announce
     tie_note = " (tie - no W/L changes)" if score_a == score_b else ""
-    await inter.response.send_message(
-        f"recorded result for {label}: **{score_a}–{score_b}**{tie_note}.",ephemeral=True)
+    label = f"<@&{a}> vs <@&{b}>"
+    msg = f"recorded result for {label}: **{score_a}–{score_b}**{tie_note}."
+
+    # if in match thread, reply publicly; otherwise keep it quiet
+    await inter.response.send_message(msg, ephemeral=False)
 
 
 # /match add <tournament_id> <swiss|double_elim|roundrobin> [rounds] <start_time>
