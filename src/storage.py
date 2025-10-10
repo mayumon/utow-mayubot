@@ -6,6 +6,8 @@ import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime, timedelta
 
 DB_PATH = "utow.db"
 
@@ -46,6 +48,7 @@ CREATE TABLE IF NOT EXISTS matches (
     score_a             INTEGER,
     score_b             INTEGER,
     reported            INTEGER DEFAULT 0,
+    bracket             TEXT, -- WB, LB, NULL
     
     tournament_name     TEXT NOT NULL REFERENCES settings(tournament_name) ON DELETE CASCADE,
     PRIMARY KEY (tournament_name, match_id)
@@ -81,7 +84,9 @@ CREATE INDEX IF NOT EXISTS idx_matches_phase_round
     
 CREATE INDEX IF NOT EXISTS idx_reminders_due
   ON reminders(when_utc, sent);
-    
+  
+CREATE INDEX IF NOT EXISTS idx_matches_phase_round_bracket
+  ON matches(tournament_name, phase, round_no, bracket);
 
 """
 class TeamIdInUseError(Exception):
@@ -258,6 +263,15 @@ def set_match_time(tournament_name: str, match_id: int, start_time_local: str) -
     upsert_match(tournament_name, match_id, start_time_local=start_time_local, clear_poke=True)
 
 
+def set_match_teams(slug: str, match_id: int, *, team_a_role_id: int, team_b_role_id: int) -> None:
+    with connect() as con:
+        con.execute("""
+            UPDATE matches
+            SET team_a_role_id=?, team_b_role_id=?
+            WHERE tournament_name=? AND match_id=?
+        """, (team_a_role_id, team_b_role_id, slug, match_id))
+
+
 def set_thread(tournament_name: str, match_id: int, thread_id: int) -> None:
     upsert_match(tournament_name, match_id, thread_id=thread_id)
 
@@ -330,43 +344,59 @@ def get_swiss_rounds(slug: str) -> Optional[int]:
 
 # create a swiss round with pairings
 # pairings: list[dict]: {"match_id": int, "team_a_role_id": int, "team_b_role_id": int, "start_time_local": Optional[str]}
-def create_swiss_round(slug: str, round_no: int, pairings: list[dict]) -> list[int]:
+def create_round(slug: str, round_no: int, pairings: list[dict], phase: str) -> list[int]:
+    """
+    Insert/upssert N matches for (slug, round_no, phase).
+    Each pairing may include: team_a_role_id, team_b_role_id, start_time_local, bracket (optional), match_id (optional).
+    Returns the assigned match_ids in order.
+    """
     assigned_ids: list[int] = []
     with connect() as con:
         cur = con.cursor()
-        # reserve a starting point once, within this transaction
         next_id = _next_match_id_in_tx(cur, slug)
 
         for p in pairings:
             mid = p.get("match_id")
             if mid is None:
                 mid = next_id
-                next_id += 1   # increment locally
+                next_id += 1
 
             assigned_ids.append(mid)
+
             cur.execute(
-                "INSERT INTO matches(tournament_name, match_id, phase, round_no, "
-                " team_a_role_id, team_b_role_id, start_time_local) "
-                "VALUES(?, ?, 'swiss', ?, ?, ?, ?) "
-                "ON CONFLICT(tournament_name, match_id) DO UPDATE SET "
-                " phase='swiss', round_no=excluded.round_no, "
-                " team_a_role_id=excluded.team_a_role_id, "
-                " team_b_role_id=excluded.team_b_role_id, "
-                " start_time_local=COALESCE(excluded.start_time_local, matches.start_time_local)",
-                (slug, mid, round_no, p.get("team_a_role_id"), p.get("team_b_role_id"), p.get("start_time_local")),
+                """
+                INSERT INTO matches(
+                    tournament_name, match_id, phase, round_no,
+                    team_a_role_id, team_b_role_id, start_time_local, bracket
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tournament_name, match_id) DO UPDATE SET
+                  phase=excluded.phase,
+                  round_no=excluded.round_no,
+                  team_a_role_id=excluded.team_a_role_id,
+                  team_b_role_id=excluded.team_b_role_id,
+                  start_time_local=COALESCE(excluded.start_time_local, matches.start_time_local),
+                  bracket=COALESCE(excluded.bracket, matches.bracket)
+                """,
+                (
+                    slug, mid, phase, round_no,
+                    p.get("team_a_role_id"), p.get("team_b_role_id"),
+                    p.get("start_time_local"),
+                    p.get("bracket"),
+                ),
             )
     return assigned_ids
 
 
 
-def list_round_matches(slug: str, round_no: int) -> list[dict]:
+def list_round_matches(slug: str, round_no: int, phase: str) -> list[dict]:
     with connect() as con:
         cur = con.cursor()
         cur.execute(
-            "SELECT match_id, team_a_role_id, team_b_role_id, start_time_local, score_a, score_b, reported "
-            "FROM matches WHERE tournament_name=? AND phase='swiss' AND round_no=? "
+            "SELECT match_id, team_a_role_id, team_b_role_id, start_time_local, score_a, score_b, reported, bracket "
+            "FROM matches WHERE tournament_name=? AND phase=? AND round_no=? "
             "ORDER BY match_id",
-            (slug, round_no),
+            (slug, phase, round_no),
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -390,24 +420,24 @@ def swiss_history(slug: str) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-def get_latest_round(slug: str) -> int:
+def get_latest_round(slug: str, phase: str) -> int:
     with connect() as con:
         cur = con.cursor()
         cur.execute(
-            "SELECT COALESCE(MAX(round_no), 0) AS r FROM matches WHERE tournament_name=? AND phase='swiss'",
-            (slug,)
+            "SELECT COALESCE(MAX(round_no), 0) AS r FROM matches WHERE tournament_name=? AND phase=?",
+            (slug, phase,)
         )
         row = cur.fetchone()
         return int(row["r"] or 0)
 
 
-def is_round_fully_reported(slug: str, round_no: int) -> bool:
+def is_round_fully_reported(slug: str, round_no: int, phase: str) -> bool:
     with connect() as con:
         cur = con.cursor()
         cur.execute(
             "SELECT COUNT(*) AS c, SUM(CASE WHEN reported=1 THEN 1 ELSE 0 END) AS rep "
-            "FROM matches WHERE tournament_name=? AND phase='swiss' AND round_no=?",
-            (slug, round_no)
+            "FROM matches WHERE tournament_name=? AND phase=? AND round_no=?",
+            (slug, phase, round_no)
         )
         row = cur.fetchone()
         total = int(row["c"] or 0)
@@ -415,39 +445,39 @@ def is_round_fully_reported(slug: str, round_no: int) -> bool:
         return total > 0 and rep == total
 
 
-def round_exists(slug: str, round_no: int) -> bool:
+def round_exists(slug: str, round_no: int, phase: str) -> bool:
     with connect() as con:
         cur = con.cursor()
         cur.execute(
-            "SELECT 1 FROM matches WHERE tournament_name=? AND phase='swiss' AND round_no=? LIMIT 1",
-            (slug, round_no)
+            "SELECT 1 FROM matches WHERE tournament_name=? AND phase=? AND round_no=? LIMIT 1",
+            (slug, phase, round_no)
         )
         return cur.fetchone() is not None
 
 
-def delete_unreported_round(slug: str, round_no: int) -> int:
+def delete_unreported_round(slug: str, round_no: int, phase: str) -> int:
     with connect() as con:
         cur = con.cursor()
         cur.execute(
-            "DELETE FROM matches WHERE tournament_name=? AND phase='swiss' AND round_no=? AND reported=0",
-            (slug, round_no)
+            "DELETE FROM matches WHERE tournament_name=? AND phase=? AND round_no=? AND reported=0",
+            (slug, phase, round_no)
         )
         return cur.rowcount
 
 
-def get_latest_fully_reported_round(slug: str) -> Optional[int]:
+def get_latest_fully_reported_round(slug: str, phase: str) -> Optional[int]:
     """Return the highest round_no that is fully reported, or None if none."""
     with connect() as con:
         cur = con.cursor()
         cur.execute("""
             SELECT round_no
             FROM matches
-            WHERE tournament_name=? AND phase='swiss'
+            WHERE tournament_name=? AND phase=?
             GROUP BY round_no
             HAVING COUNT(*) = SUM(CASE WHEN reported=1 THEN 1 ELSE 0 END)
             ORDER BY round_no DESC
             LIMIT 1
-        """, (slug,))
+        """, (slug, phase))
         row = cur.fetchone()
         return int(row["round_no"]) if row else None
 
@@ -474,43 +504,43 @@ def _next_match_id_in_tx(cur, tournament_name: str) -> int:
     return int(row["n"]) + 1
 
 
-def round_has_placeholders(slug: str, round_no: int) -> bool:
+def round_has_placeholders(slug: str, round_no: int, phase: str) -> bool:
     with connect() as con:
         cur = con.cursor()
         cur.execute("""
             SELECT 1
             FROM matches
-            WHERE tournament_name=? AND phase='swiss' AND round_no=?
+            WHERE tournament_name=? AND phase=? AND round_no=?
               AND team_a_role_id IS NULL AND team_b_role_id IS NULL
             LIMIT 1
-        """, (slug, round_no))
+        """, (slug, phase, round_no))
         return cur.fetchone() is not None
 
 
-def list_round_placeholders(slug: str, round_no: int) -> list[int]:
+def list_round_placeholders(slug: str, round_no: int, phase: str) -> list[int]:
     with connect() as con:
         cur = con.cursor()
         cur.execute("""
             SELECT match_id
             FROM matches
-            WHERE tournament_name=? AND phase='swiss' AND round_no=?
+            WHERE tournament_name=? AND phase=? AND round_no=?
               AND team_a_role_id IS NULL AND team_b_role_id IS NULL
             ORDER BY match_id
-        """, (slug, round_no))
+        """, (slug, phase, round_no))
         return [int(r["match_id"]) for r in cur.fetchall()]
 
 
-def assign_pairs_into_round(slug: str, round_no: int, pairs: list[tuple[int, int]]) -> None:
+def assign_pairs_into_round(slug: str, round_no: int, pairs: list[tuple[int, int]], phase: str) -> None:
 
     with connect() as con:
         cur = con.cursor()
         cur.execute("""
             SELECT match_id
             FROM matches
-            WHERE tournament_name=? AND phase='swiss' AND round_no=?
+            WHERE tournament_name=? AND phase=? AND round_no=?
               AND team_a_role_id IS NULL AND team_b_role_id IS NULL
             ORDER BY match_id
-        """, (slug, round_no))
+        """, (slug, phase, round_no))
         mids = [int(r["match_id"]) for r in cur.fetchall()]
         if len(mids) != len(pairs):
             raise ValueError(f"pair-count {len(pairs)} != placeholders {len(mids)} in round {round_no}")
@@ -518,8 +548,8 @@ def assign_pairs_into_round(slug: str, round_no: int, pairs: list[tuple[int, int
             cur.execute("""
                 UPDATE matches
                 SET team_a_role_id=?, team_b_role_id=?
-                WHERE tournament_name=? AND match_id=? AND phase='swiss' AND round_no=?
-            """, (a, b, slug, mid, round_no))
+                WHERE tournament_name=? AND match_id=? AND phase=? AND round_no=?
+            """, (a, b, slug, mid, phase, round_no))
 
 
 def get_team_display_map(slug: str) -> dict[int, str]:
@@ -546,18 +576,21 @@ def list_all_matches_full(slug: str) -> list[dict]:
         cur.execute("""
             SELECT match_id, phase, round_no, start_time_local,
                    team_a_role_id, team_b_role_id,
-                   score_a, score_b, reported
+                   score_a, score_b, reported, bracket
             FROM matches
             WHERE tournament_name=?
             ORDER BY
-              CASE phase WHEN 'swiss' THEN 1 WHEN 'playoff' THEN 2 ELSE 3 END,
-              COALESCE(round_no, 0),
-              match_id
+                CASE phase
+                    WHEN 'swiss' THEN 1
+                    WHEN 'roundrobin' THEN 2
+                    WHEN 'double_elim' THEN 3
+                    ELSE 9
+                  END,
+                  COALESCE(round_no, 0),
+                  match_id
         """, (slug,))
         return [dict(r) for r in cur.fetchall()]
 
-from zoneinfo import ZoneInfo
-from datetime import datetime, timedelta
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")

@@ -225,10 +225,10 @@ async def setup_team_list(inter: discord.Interaction, tournament_id: str):
         tid = int(r["team_id"])
         dn = (r["display_name"] or "").strip()
         label = dn if dn else f"<@&{rid}>"
-        lines.append(f"• **{label}** — team_id `{tid}` — role <@&{rid}>")
+        lines.append(f"• **{label}** - team_id `{tid}` - role <@&{rid}>")
 
     embed = discord.Embed(
-        title=f"Teams — {tournament_id}",
+        title=f"Teams - {tournament_id}",
         color=0xB54882
     )
 
@@ -310,7 +310,7 @@ async def reminders_set(
         n = schedule_match_reminders(tournament_id, match_id)
         m2 = get_match(tournament_id, match_id)
         has_thread = bool(m2 and m2.get("thread_id"))
-        suffix = " (no thread — reminders will not post)" if not has_thread else ""
+        suffix = " (no thread - reminders will not post)" if not has_thread else ""
         return await inter.response.send_message(
             f"scheduled {n} reminder(s) for match `#{match_id}`{suffix}.",
             ephemeral=True
@@ -364,7 +364,7 @@ async def reminders_list(
         by_match[int(r["match_id"])].append(r)
 
     embed = discord.Embed(
-        title=f"Reminders — {tournament_id}",
+        title=f"Reminders - {tournament_id}",
         color=0xB54882
     )
     embed.set_footer(text=f"All times shown in {tz}")
@@ -375,7 +375,7 @@ async def reminders_list(
         dt_utc = datetime.strptime(r["when_utc"], "%Y-%m-%d %H:%M").replace(tzinfo=safe_zoneinfo("UTC"))
         dt_loc = dt_utc.astimezone(tzinfo)
         local_txt = dt_loc.strftime("%Y-%m-%d %H:%M")
-        return f"- `{r['kind']}` at `{local_txt}` — {status}", dt_utc
+        return f"- `{r['kind']}` at `{local_txt}` - {status}", dt_utc
 
     for mid in sorted(by_match.keys()):
 
@@ -410,9 +410,11 @@ bot.tree.add_command(reminders)
 
 match = app_commands.Group(name="match", description="match utilities")
 
+thread = app_commands.Group(name="thread", description="manage match threads", parent=match)
 
-# /match thread <match_id>
-@match.command(name="thread", description="create a private match thread for the two teams in a match.")
+
+# /match thread create <match_id>
+@thread.command(name="create", description="create a private match thread for the two teams in a match.")
 @app_commands.describe(
     tournament_id="tournament ID",
     match_id="match ID"
@@ -462,14 +464,28 @@ async def match_thread(
             "one or both team roles no longer exist on this server.", ephemeral=True
         )
 
-    # title
+    # ---------- title ----------
+    def _phase_prefix(phase: str, round_no: int | None) -> str:
+        rn = str(round_no) if round_no is not None else "?"
+        p = (phase or "").lower()
+        if p == "playoff":
+            return f"playoffs round {rn}"
+        if p == "swiss":
+            return f"swiss round {rn}"
+        if p == "roundrobin":
+            return f"round robin {rn}"
+        if p == "double_elim":
+            return f"double elimination {rn}"
+        return f"round {rn}"
+
     phase = (m.get("phase") or "").lower()
     round_no = m.get("round_no")
-    title_prefix = "Playoffs Round" if phase == "playoff" else "Round"
-    round_label = round_no if round_no is not None else "?"
-    title = f"{title_prefix} {round_label}: {a_role.name} vs {b_role.name}"
+    prefix = _phase_prefix(phase, round_no)
 
-    # create a PRIVATE thread (only invited users & mods)
+    base_title = f"{prefix}: {a_role.name} vs {b_role.name}"
+    title = base_title[:100]
+
+    # ---------- create thread ----------
     try:
         thread = await channel.create_thread(
             name=title,
@@ -489,7 +505,6 @@ async def match_thread(
     try:
         set_thread(tournament_id, match_id, thread.id)
     except Exception:
-        # non-fatal; continue
         pass
 
     # format scheduled time
@@ -511,13 +526,10 @@ async def match_thread(
     if when_txt:
         body_lines.append(f"current scheduled time: **{when_txt}**")
 
-    # ensure role pings are allowed in this message
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
-
     try:
         await thread.send("\n".join(body_lines), allowed_mentions=allowed)
     except Exception:
-        # if the first message fails
         pass
 
     # proactively invite role members
@@ -529,26 +541,17 @@ async def match_thread(
                     await thread.add_user(member)
                     invited += 1
                 except discord.Forbidden:
-                    # missing perms to add a particular user
                     continue
                 except Exception:
                     continue
         except Exception:
             continue
 
-    # pointer message to parent
-    pointer_lines = [
-        f"**▶ match thread created:** {thread.mention}",
-    ]
-
-    # don't ping roles in the public pointer
     no_pings = discord.AllowedMentions(everyone=False, users=False, roles=False)
-
     try:
-        pointer_msg = await channel.send("\n".join(pointer_lines), allowed_mentions=no_pings)
-
+        await channel.send(f"**▶ match thread created:** {thread.mention}", allowed_mentions=no_pings)
     except Exception:
-        pass  # pointer is nice-to-have; don't fail the command if it can't be posted
+        pass
 
     await inter.response.send_message(
         embed=discord.Embed(
@@ -560,8 +563,9 @@ async def match_thread(
             ]),
             color=0xB54882
         ),
-        ephemeral=True
+        ephemeral=False
     )
+
 
 # /match poke <match_id> [time|standard] TODO
 
@@ -652,6 +656,58 @@ async def match_settime(
         ephemeral=True
     )
 
+# /match setteam <tournament_id> <match_id> <@team_a> <@team_b>
+@match.command(
+    name="setteam",
+    description="assign Team A and Team B (roles) to a match placeholder"
+)
+@app_commands.describe(
+    tournament_id="tournament ID",
+    match_id="match ID",
+    team_a="Discord role for Team A",
+    team_b="Discord role for Team B",
+)
+async def match_setteam(
+    inter: discord.Interaction,
+    tournament_id: str,
+    match_id: int,
+    team_a: discord.Role,
+    team_b: discord.Role,
+):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+    if not get_settings(tournament_id):
+        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+
+    m = get_match(tournament_id, match_id)
+    if not m:
+        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
+    if team_a.id == team_b.id:
+        return await inter.response.send_message("team A and team B must be different roles.", ephemeral=True)
+
+    # optional: validate the roles are mapped to this tournament
+    mapped_ids = {int(r["team_role_id"]) for r in list_teams(tournament_id)}
+    if team_a.id not in mapped_ids or team_b.id not in mapped_ids:
+        return await inter.response.send_message(
+            "both roles must be mapped to this tournament (`/setup team add`).", ephemeral=True
+        )
+
+    # write
+    set_match_teams(tournament_id, match_id, team_a_role_id=team_a.id, team_b_role_id=team_b.id)
+
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title="teams assigned",
+            description="\n".join([
+                f"**match:** #{match_id}",
+                f"**team A:** {team_a.mention}",
+                f"**team B:** {team_b.mention}",
+            ]),
+            color=0xB54882
+        ),
+        ephemeral=True
+    )
+
 
 # /match report <tournament_id> <match_id> <score_a> <score_b>
 @match.command(name="report", description="report a match score")
@@ -680,127 +736,291 @@ async def match_report(inter: discord.Interaction, tournament_id: str, match_id:
     await inter.response.send_message(f"recorded result for {label}: **{score_a}–{score_b}**.", ephemeral=True)
 
 
-# /match add <tournament_id> <swiss|double_elim|round_robin> <round_num>
+# /match add <tournament_id> <swiss|double_elim|roundrobin> [rounds] <start_time>
 @match.command(
     name="add",
-    description="generate and add N swiss rounds"
+    description="generate and add rounds for swiss, round-robin, or double-elim"
 )
 @app_commands.describe(
     tournament_id="tournament ID",
     kind="swiss/double_elim/roundrobin",
-    rounds="how many rounds to add",
-    start_time="local start time for round 1 in YYYY-MM-DD HH:MM format"
+    rounds="number of rounds (default 1)",
+    start_time="local start time for round 1 in YYYY-MM-DD HH:MM (24h) format"
 )
 async def match_add(
-        inter: discord.Interaction,
-        tournament_id: str,
-        kind: Literal["swiss", "double_elim"],
-        rounds: int,
-        start_time: str,
+    inter: discord.Interaction,
+    tournament_id: str,
+    kind: Literal["swiss", "double_elim", "roundrobin"],
+    rounds: int = 1,
+    start_time: str = "",
 ):
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms.", ephemeral=True)
     if not get_settings(tournament_id):
         return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.",
                                                  ephemeral=True)
-    if kind != "swiss":
-        return await inter.response.send_message("double_elim not implemented yet.", ephemeral=True)
     if rounds < 1:
         return await inter.response.send_message("`rounds` must be ≥ 1.", ephemeral=True)
 
     # parse round 1 baseline time
     try:
         base_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
-    except ValueError:
+    except Exception:
         return await inter.response.send_message(
-            "invalid `start_time` format. use `YYYY-MM-DD HH:MM`",
-            ephemeral=True
+            "invalid `start_time` format. use `YYYY-MM-DD HH:MM`", ephemeral=True
         )
 
     created_blocks: list[str] = []
-    latest = get_latest_round(tournament_id)
+    phase = kind
+    latest = get_latest_round(tournament_id, phase)  # highest round number already created
 
     # team pool
     mapped = list_teams(tournament_id)
-    team_ids = [row["team_role_id"] for row in mapped]
-    if len(team_ids) < 2 or len(team_ids) % 2 != 0:
-        return await inter.response.send_message(
-            "need an **even** number of mapped teams (≥2). Map teams first with `/setup team`.",
-            ephemeral=True
-        )
+    team_ids = [int(row["team_role_id"]) for row in mapped]
+    if len(team_ids) < 2:
+        return await inter.response.send_message("need at least 2 mapped teams. map with `/setup team`.", ephemeral=True)
 
+    # helper display
     name_map = get_team_display_map(tournament_id)
-
     def label(role_id: int | None) -> str:
         if role_id is None:
-            return "TBD"
+            return "BYE"
         return name_map.get(role_id, f"role:{role_id}")
+    def gen_roundrobin_pairs(ids: list[int]) -> list[list[tuple[int | None, int | None]]]:
+        players = ids[:]
+        if len(players) % 2 == 1:
+            players.append(None)  # BYE
+        n = len(players)
+        rounds = n - 1
 
+        schedule: list[list[tuple[int | None, int | None]]] = []
+        arr = players[:]  # working order
+
+        for _ in range(rounds):
+            # pair ends toward the middle
+            pairs: list[tuple[int | None, int | None]] = []
+            for i in range(n // 2):
+                a = arr[i]
+                b = arr[n - 1 - i]
+                pairs.append((a, b))
+            schedule.append(pairs)
+
+            # rotate everyone except the first element
+            arr = [arr[0]] + [arr[-1]] + arr[1:-1]
+
+        return schedule
+
+    def seeded_team_ids_for_de(tournament_id: str) -> list[int]:
+        """Seeding = ascending team_id. Returns role_ids in seed order 1..N."""
+        rows = list_teams(tournament_id)
+        rows.sort(key=lambda r: int(r["team_id"]))
+        return [int(r["team_role_id"]) for r in rows]
+
+    def de_template_counts(num_teams: int, round_no: int) -> list[tuple[str, int]]:
+        """
+        return list of (bracket_tag, count) for the given round_no (1..4).
+        Supported sizes: 4, 6, 8. Bracket tags:
+          - WB, LB, GF as usual
+          - LCQ = lower-seed play-ins (6-team Round 1)
+          - 3P  = 3rd place match (6-team Round 4)
+          - 4P  = 4th place match (8-team Round 3)
+        """
+        if num_teams == 4:
+            plan = {
+                1: [("WB", 2)],  # 1v4, 2v3
+                2: [("WB", 1), ("LB", 1)],  # upper final + LB
+                3: [("LB", 1)],  # loser final
+                4: [("GF", 1)],  # grand final
+            }
+            return plan.get(round_no, [])
+
+        if num_teams == 6:
+            plan = {
+                1: [("LCQ", 2)],  # 3v6, 4v5
+                2: [("WB", 2)],  # winners vs 1st/2nd seeds
+                3: [("WB", 1), ("LB", 1)],  # upper final + LB
+                4: [("3P", 1), ("GF", 1)],  # 3rd place + grand final
+            }
+            return plan.get(round_no, [])
+
+        if num_teams == 8:
+            plan = {
+                1: [("WB", 4)],  # quarters
+                2: [("WB", 2), ("LB", 2)],  # semis + LB (2 upper, 4 lower participants)
+                3: [("WB", 1), ("LB", 1), ("4P", 1)],  # upper final + loser semi + 4th-place match
+                4: [("LB", 1), ("GF", 1)],  # loser final + grand final
+            }
+            return plan.get(round_no, [])
+
+        return []
+
+    # Create rounds
     for _ in range(rounds):
         target_round = latest + 1
 
-        if round_exists(tournament_id, target_round):
-            # still show a block so user knows it was skipped
-            round_date = (base_dt + timedelta(weeks=(target_round - 1))).strftime("%B %d, %Y at %I:%M%p")
-            created_blocks.append(f"》Round {target_round}\n(already exists)\n\n[{round_date}]")
-            latest = target_round
-            continue
-
-        # compute round's start timestamp string
+        # compute start times
         r_start_dt = base_dt + timedelta(weeks=(target_round - 1))
         r_start_str = r_start_dt.strftime("%Y-%m-%d %H:%M")
         round_date_pretty = r_start_dt.strftime("%B %d, %Y at %I:%M%p")
 
-        lines: list[str] = [f"》Round {target_round}"]
+        if round_exists(tournament_id, target_round, phase):
+            created_blocks.append(f"》round {target_round}\n(already exists)\n\n[{round_date_pretty}]")
+            latest = target_round
+            continue
 
-        if latest == 0 and target_round == 1:
-            # round 1: assign pairings now
-            ids = team_ids[:]
-            random.shuffle(ids)
+        lines: list[str] = [f"》round {target_round}"]
+
+        if phase == "swiss":
+            # swiss requires an even number of teams
+            if len(team_ids) % 2 != 0:
+                return await inter.response.send_message(
+                    "swiss requires an **even** number of teams.", ephemeral=True
+                )
+            if latest == 0 and target_round == 1:
+                # round 1: random pairings now
+                ids = team_ids[:]
+                random.shuffle(ids)
+                pairings = []
+                for i in range(0, len(ids), 2):
+                    a, b = ids[i], ids[i+1]
+                    pairings.append({
+                        "match_id": None,
+                        "team_a_role_id": a,
+                        "team_b_role_id": b,
+                        "start_time_local": r_start_str
+                    })
+                assigned = create_round(tournament_id, target_round, pairings, phase=phase)
+                for i, mid in enumerate(assigned):
+                    a = label(pairings[i]["team_a_role_id"]); b = label(pairings[i]["team_b_role_id"])
+                    lines.append(f"☆ match #{mid}:\n{a} vs {b} ━ score: -")
+            else:
+                # later rounds: placeholders
+                match_count = len(team_ids) // 2
+                pairings = [{
+                    "match_id": None,
+                    "team_a_role_id": None,
+                    "team_b_role_id": None,
+                    "start_time_local": r_start_str
+                } for _ in range(match_count)]
+                assigned = create_round(tournament_id, target_round, pairings, phase=phase)
+                for mid in assigned:
+                    lines.append(f"☆ match #{mid}: TBD vs TBD ━ score: -")
+
+        elif phase == "roundrobin":
+            # RR can handle odd teams (BYE).
+            rr = gen_roundrobin_pairs(team_ids)
+            rr_round = rr[(target_round - 1) % len(rr)]
             pairings = []
-            for i in range(0, len(ids), 2):
-                a, b = ids[i], ids[i + 1]
+            for a, b in rr_round:
+                if a is None or b is None:
+                    continue  # skip BYE match
                 pairings.append({
                     "match_id": None,
                     "team_a_role_id": a,
                     "team_b_role_id": b,
                     "start_time_local": r_start_str
                 })
-            assigned = create_swiss_round(tournament_id, target_round, pairings)
-
-            # output
+            if not pairings:
+                pairings = [{
+                    "match_id": None,
+                    "team_a_role_id": None,
+                    "team_b_role_id": None,
+                    "start_time_local": r_start_str
+                }]
+            assigned = create_round(tournament_id, target_round, pairings, phase=phase)
             for i, mid in enumerate(assigned):
-                a = label(pairings[i]["team_a_role_id"])
-                b = label(pairings[i]["team_b_role_id"])
+                a = label(pairings[i]["team_a_role_id"]); b = label(pairings[i]["team_b_role_id"])
+                a = a if a != "BYE" else "TBD"; b = b if b != "BYE" else "TBD"
                 lines.append(f"☆ match #{mid}:\n{a} vs {b} ━ score: -")
-        else:
-            # later rounds: placeholders with dates set (TBD names)
-            match_count = len(team_ids) // 2
-            pairings = [{
-                "match_id": None,
-                "team_a_role_id": None,
-                "team_b_role_id": None,
-                "start_time_local": r_start_str
-            } for _ in range(match_count)]
-            assigned = create_swiss_round(tournament_id, target_round, pairings)
 
-            for mid in assigned:
-                lines.append(f"☆ match #{mid}: TBD vs TBD ━ score: -")
+
+        elif phase == "double_elim":
+
+            if target_round > 4:
+                created_blocks.append(f"》round {target_round}\n(skipped: DE is capped to 4 rounds)\n")
+                latest = target_round
+                continue
+            n = len(team_ids)
+            if n not in (4, 6, 8):
+                return await inter.response.send_message(
+                    "double_elim supports **4**, **6**, or **8** teams (4 rounds only).", ephemeral=True
+                )
+            # Round 1: create seeded pairings when specification requires them
+            if target_round == 1:
+                seeds = seeded_team_ids_for_de(tournament_id)
+                pairings = []
+                if n == 4:
+                    # 1v4, 2v3
+                    pairs = [(seeds[0], seeds[3]), (seeds[1], seeds[2])]
+                    for a, b in pairs:
+                        pairings.append({
+                            "match_id": None, "team_a_role_id": a, "team_b_role_id": b,
+                            "start_time_local": r_start_str, "bracket": "WB"
+                        })
+
+                elif n == 6:
+                    # LCQ: 3v6, 4v5
+                    pairs = [(seeds[2], seeds[5]), (seeds[3], seeds[4])]
+                    for a, b in pairs:
+                        pairings.append({
+                            "match_id": None, "team_a_role_id": a, "team_b_role_id": b,
+                            "start_time_local": r_start_str, "bracket": "LCQ"
+                        })
+
+                else:  # n == 8
+                    # Quarters (typical seeding path): 1v8, 4v5, 3v6, 2v7
+                    pairs = [(seeds[0], seeds[7]), (seeds[3], seeds[4]),
+                             (seeds[2], seeds[5]), (seeds[1], seeds[6])]
+                    for a, b in pairs:
+                        pairings.append({
+                            "match_id": None, "team_a_role_id": a, "team_b_role_id": b,
+                            "start_time_local": r_start_str, "bracket": "WB"
+                        })
+                assigned = create_round(tournament_id, target_round, pairings, phase=phase)
+                for i, mid in enumerate(assigned):
+                    br = pairings[i]["bracket"]
+                    a = label(pairings[i]["team_a_role_id"]);
+                    b = label(pairings[i]["team_b_role_id"])
+                    lines.append(f"☆ match #{mid} ({br}):\n{a} vs {b} ━ score: -")
+
+            else:
+                # Later rounds: placeholders follow the template
+                counts = de_template_counts(n, target_round)
+                if not counts:
+                    created_blocks.append(f"》round {target_round}\n(no matches in template)\n")
+                    latest = target_round
+                    continue
+                pairings = []
+                for br, cnt in counts:
+                    for _ in range(cnt):
+                        pairings.append({
+                            "match_id": None,
+                            "team_a_role_id": None,
+                            "team_b_role_id": None,
+                            "start_time_local": r_start_str,
+                            "bracket": br
+                        })
+                assigned = create_round(tournament_id, target_round, pairings, phase=phase)
+                cursor = 0
+                for br, cnt in counts:
+                    for _ in range(cnt):
+                        lines.append(f"☆ match #{assigned[cursor]} ({br}): TBD vs TBD ━ score: -")
+                        cursor += 1
 
         # one date line per round
         lines.append(f"[{round_date_pretty}]")
-
         created_blocks.append("\n".join(lines))
         latest = target_round  # advance
 
     await inter.response.send_message(
         embed=discord.Embed(
-            title=f"Swiss rounds created — {tournament_id}",
+            title=f"{kind.replace('_',' ').title()} rounds created - {tournament_id}",
             description="\n\n".join(created_blocks) if created_blocks else "No rounds created.",
             color=0xB54882
         ),
         ephemeral=True
     )
+
 
 
 bot.tree.add_command(match)
@@ -810,23 +1030,42 @@ bot.tree.add_command(match)
 tournament = app_commands.Group(name="tournament", description="tournament utilities")
 
 
-# /tournament list
-@tournament.command(name="list", description="list all matches by round with scores and dates")
+# /tournament schedule
+@tournament.command(
+    name="schedule",
+    description="list all matches by phase and round with scores and dates"
+)
 @app_commands.describe(slug="tournament slug")
 async def tournament_list(inter: discord.Interaction, slug: str):
     if not get_settings(slug):
         return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first.", ephemeral=True)
 
-    rows = list_all_matches_full(slug)
+    rows = list_all_matches_full(slug)  # expects phase, round_no, etc.
     if not rows:
-        return await inter.response.send_message(f"No matches found for `{slug}` yet.", ephemeral=True)
+        return await inter.response.send_message(f"no matches found for `{slug}` yet.", ephemeral=True)
 
     name_map = get_team_display_map(slug)
 
-    def team_label(role_id: int | None) -> str:
-        if role_id is None:
-            return "TBD"
-        return name_map.get(role_id, f"<@&{role_id}>")
+    def rr_bye_label(phase: str | None, a_id: int | None, b_id: int | None, *, mention: bool = False) -> tuple[
+        str, str]:
+        """
+        Returns (a_label, b_label) with BYE handling for roundrobin.
+        If mention=True, only mention real teams; BYE is plain text.
+        """
+        ph = (phase or "").lower()
+        is_rr = ph == "roundrobin"
+
+        def lbl(role_id: int | None) -> str:
+            if role_id is None:
+                return "BYE" if is_rr else "TBD"
+            return (f"<@&{role_id}>" if mention else name_map.get(role_id, f"<@&{role_id}>"))
+
+        return lbl(a_id), lbl(b_id)
+
+    def phase_title(p: str | None) -> str:
+        if not p:
+            return "unspecified"
+        return {"swiss": "swiss", "double_elim": "double elimination", "roundrobin": "round robin"}.get(p, p.title())
 
     def ordinal(n: int) -> str:
         if 10 <= (n % 100) <= 20:
@@ -835,10 +1074,7 @@ async def tournament_list(inter: discord.Interaction, slug: str):
             suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
         return f"{n}{suf}"
 
-    from datetime import datetime
-
     def fmt_when(s: str | None) -> str | None:
-        """Pretty date like: [October 17th, 2025 at 8:00PM]"""
         if not s:
             return None
         try:
@@ -851,56 +1087,67 @@ async def tournament_list(inter: discord.Interaction, slug: str):
         except Exception:
             return f"[{s}]"
 
-    from collections import defaultdict
-    grouped: dict[int | None, list[dict]] = defaultdict(list)
+    # --- group by phase -> round_no; preserve phase order as seen in rows ---
+    from collections import defaultdict, OrderedDict
+    by_phase_round: dict[str | None, dict[int | None, list[dict]]] = OrderedDict()
     for r in rows:
-        grouped[r["round_no"]].append(r)
+        ph = r.get("phase")
+        if ph not in by_phase_round:
+            by_phase_round[ph] = defaultdict(list)
+        by_phase_round[ph][r.get("round_no")].append(r)
 
-    ordered_rounds = sorted(grouped.keys(), key=lambda x: (x is None, x if x is not None else 0))
-
+    # --- build embeds ---
     embeds: list[discord.Embed] = []
-    current = discord.Embed(
-        title=f"Matches — {slug}",
-        description="",
-        color=0xB54882
-    )
+    current = discord.Embed(title=f"matches - {slug}", color=0xB54882)
     fields_in_current = 0
 
     def flush_embed():
         nonlocal current, fields_in_current
         if fields_in_current > 0:
             embeds.append(current)
-            current = discord.Embed(title=f"Matches — {slug} (cont.)", color=0xB54882)
+            current = discord.Embed(title=f"matches - {slug} (cont.)", color=0xB54882)
             fields_in_current = 0
 
-    for rn in ordered_rounds:
-        round_matches = grouped[rn]
+    # for each phase, then each round within that phase (by round_no asc, None last)
+    for phase, rounds_map in by_phase_round.items():
+        # Phase header field (empty value just as a divider)
+        current.add_field(name=f"**{phase_title(phase)}**", value="\u200b", inline=False)
+        fields_in_current += 1
+        if fields_in_current >= 24:
+            flush_embed()
 
-        blocks: list[str] = []
-        for r in sorted(round_matches, key=lambda x: x["match_id"]):
-            a = team_label(r["team_a_role_id"])
-            b = team_label(r["team_b_role_id"])
-            sa = r["score_a"]
-            sb = r["score_b"]
+        for rn in sorted(rounds_map.keys(), key=lambda x: (x is None, x if x is not None else 0)):
+            round_matches = rounds_map[rn]
 
-            score_text = f"{sa}-{sb}" if r["reported"] and sa is not None and sb is not None else "_ - _"
+            # compose blocks for matches in this round
+            blocks: list[str] = []
+            for r in sorted(round_matches, key=lambda x: x["match_id"]):
+                a_id = r.get("team_a_role_id")
+                b_id = r.get("team_b_role_id")
+                a, b = rr_bye_label(r.get("phase"), a_id, b_id, mention=False)
+                sa, sb = r.get("score_a"), r.get("score_b")
+                score_text = f"{sa}-{sb}" if r.get("reported") and sa is not None and sb is not None else "_ - _"
 
-            top_line = f"☆ match #{r['match_id']}:\n{a} vs {b} ━ score: {score_text}"
-            when_line = fmt_when(r["start_time_local"])
-            block = top_line + (f"\n{when_line}" if when_line else "")
-            blocks.append(block)
+                # show bracket tag if present (helps double_elim)
+                br = (r.get("bracket") or "").upper() if "bracket" in r else ""
+                br_prefix = f"({br}) " if br else ""
 
-        chunk_size = 8
-        for i in range(0, len(blocks), chunk_size):
-            chunk = blocks[i:i + chunk_size]
-            header = f"**》Round {rn if rn is not None else '-'}**"
-            if len(blocks) > chunk_size:
-                header += f" (part {i // chunk_size + 1})"
-            value = "\n\n".join(chunk)
-            current.add_field(name=header, value=value, inline=False)
-            fields_in_current += 1
-            if fields_in_current >= 24:
-                flush_embed()
+                top_line = f"☆ match #{r['match_id']}:\n{br_prefix}{a} vs {b} ━ score: {score_text}"
+                when_line = fmt_when(r.get("start_time_local"))
+                block = top_line + (f"\n{when_line}" if when_line else "")
+                blocks.append(block)
+
+            # chunk large rounds to respect embed field limits
+            chunk_size = 8
+            for i in range(0, len(blocks), chunk_size):
+                chunk = blocks[i:i + chunk_size]
+                header = f"》round {rn if rn is not None else '-'}"
+                if len(blocks) > chunk_size:
+                    header += f" (part {i // chunk_size + 1})"
+                current.add_field(name=header, value="\n\n".join(chunk), inline=False)
+                fields_in_current += 1
+                if fields_in_current >= 24:
+                    flush_embed()
 
     flush_embed()
     if not embeds:
@@ -913,10 +1160,10 @@ async def tournament_list(inter: discord.Interaction, slug: str):
 
 # /tournament standings TODO
 
-# /tournament announcement <post:true|false>
+# /tournament announcement <tournament_id> <post:true|false>
 @tournament.command(
     name="announcement",
-    description="post (or preview) last round results and next round games"
+    description="post/preview last round results and next round games"
 )
 @app_commands.describe(slug="tournament slug", post="post it?")
 async def tournament_announcement(inter: discord.Interaction, slug: str, post: bool):
@@ -930,15 +1177,25 @@ async def tournament_announcement(inter: discord.Interaction, slug: str, post: b
     # helpers
     name_map = get_team_display_map(slug)
 
+    def rr_bye_label(phase: str | None, a_id: int | None, b_id: int | None, *, mention: bool = False) -> tuple[
+        str, str]:
+        ph = (phase or "").lower()
+        is_rr = ph == "roundrobin"
+
+        def lbl(role_id: int | None) -> str:
+            if role_id is None:
+                return "BYE" if is_rr else "TBD"
+            return (f"<@&{role_id}>" if mention else name_map.get(role_id, f"<@&{role_id}>"))
+
+        return lbl(a_id), lbl(b_id)
+
+    def phase_title(p: str) -> str:
+        return {"swiss": "swiss", "double_elim": "double elimination", "roundrobin": "round robin"}.get(p, p.title())
+
     def label(role_id: int | None) -> str:
         if role_id is None:
             return "TBD"
         return name_map.get(role_id, f"<@&{role_id}>")
-
-    def mention_label(role_id: int | None) -> str:
-        if role_id is None:
-            return "@unknown-role"
-        return f"<@&{role_id}>"
 
     def ordinal(n: int) -> str:
         if 10 <= (n % 100) <= 20:
@@ -961,72 +1218,86 @@ async def tournament_announcement(inter: discord.Interaction, slug: str, post: b
         except Exception:
             return f"[{s_local}]"
 
-    # ----- build "last week" section -----
-    latest = get_latest_fully_reported_round(slug)
-    last_lines: list[str] = []
-    if latest:
-        ms = list_round_matches(slug, latest)
-        for m in ms:
-            a = label(m["team_a_role_id"])
-            b = label(m["team_b_role_id"])
-            sa = m.get("score_a")
-            sb = m.get("score_b")
-            if m.get("reported") and sa is not None and sb is not None:
-                if sa > sb:
-                    winner = a
-                elif sb > sa:
-                    winner = b
-                else:
-                    winner = "Draw"
-                # No bold on the pair; :star: before each team; show winner + score
-                last_lines.append(f"• :star: {a} vs. :star: {b}: {winner} win ({sa}–{sb})")
-        if not last_lines:
-            last_lines.append("• No completed matches recorded.")
-    else:
-        last_lines.append("• No fully reported round yet.")
+    # ---- Determine which phases exist in DB (so we don't hardcode)
+    all_rows = list_all_matches_full(slug)  # has phase/round_no/etc.
+    phases_present = sorted({r.get("phase") for r in all_rows if r.get("phase") is not None})
 
-    # ----- build "this week" section -----
-    next_lines: list[str] = []
-    next_round = (latest or 0) + 1
-    if round_exists(slug, next_round):
-        ms_next = list_round_matches(slug, next_round)
-        for m in ms_next:
-            a = mention_label(m["team_a_role_id"])  # ping roles
-            b = mention_label(m["team_b_role_id"])
-            when_line = fmt_when_local(m.get("start_time_local"))
-            top = f"{a} vs. {b}"
-            next_lines.append(top + (f"\n{when_line}" if when_line else ""))
-    else:
-        next_lines.append("• Next round not created yet.")
-
-    # ----- build compact "TOURNAMENT STATUS" section (no dates, single line per match) -----
-    all_rows = list_all_matches_full(slug)
-    grouped: dict[int | None, list[dict]] = defaultdict(list)
-    for r in all_rows:
-        grouped[r["round_no"]].append(r)
-
-    def team_label(role_id: int | None) -> str:
-        if role_id is None:
-            return "TBD"
-        return name_map.get(role_id, f"<@&{role_id}>")
-
-    round_sections: list[str] = []
-    for rn in sorted(grouped.keys(), key=lambda x: (x is None, x if x is not None else 0)):
+    # ---- "LAST WEEK" per phase (latest fully-reported round in that phase)
+    last_sections: list[str] = []
+    for phase in phases_present:
+        latest_full = get_latest_fully_reported_round(slug, phase)
+        if not latest_full:
+            continue
+        ms = list_round_matches(slug, latest_full, phase)
         lines: list[str] = []
-        lines.append(f"》Round {rn if rn is not None else '-'}")
-        for r in sorted(grouped[rn], key=lambda x: x["match_id"]):
-            a = team_label(r["team_a_role_id"])
-            b = team_label(r["team_b_role_id"])
-            sa, sb = r.get("score_a"), r.get("score_b")
-            score_text = f"{sa}-{sb}" if r.get("reported") and sa is not None and sb is not None else "_ - _"
-            # Single compact line, with small padding before teams for readability
-            lines.append(f"☆ match #{r['match_id']}:    {a} vs {b} ━ score: {score_text}")
-        round_sections.append("\n".join(lines))
+        for m in ms:
+            if m.get("reported") and m.get("score_a") is not None and m.get("score_b") is not None:
+                a, b = rr_bye_label(phase, m.get("team_a_role_id"), m.get("team_b_role_id"), mention=False)
+                sa, sb = m["score_a"], m["score_b"]
+                winner = a if sa > sb else (b if sb > sa else "Draw")
+                prefix = ""
+                if phase == "double_elim":
+                    br = (m.get("bracket") or "").upper()
+                    prefix = f"({br}) " if br else ""
 
-    list_text = "\n\n".join(round_sections) if round_sections else "No matches yet."
+                lines.append(f"• {prefix}{a} vs. {b}: **{winner}** win ({sa}–{sb})")
+        if lines:
+            last_sections.append(f"**{phase_title(phase)} - round {latest_full}**\n" + "\n".join(lines))
 
-    # ----- compose message (intro + dividers + sections) -----
-    divider = "—" * 64
+    include_last = len(last_sections) > 0
+
+    # ---- "THIS WEEK" per phase (next round after latest fully reported)
+    next_sections: list[str] = []
+    for phase in phases_present:
+        latest_full = get_latest_fully_reported_round(slug, phase)
+        next_round = (latest_full or 0) + 1
+        if round_exists(slug, next_round, phase):
+            ms_next = list_round_matches(slug, next_round, phase)
+            if ms_next:
+                lines: list[str] = []
+                for m in ms_next:
+                    a, b = rr_bye_label(phase, m.get("team_a_role_id"), m.get("team_b_role_id"), mention=True)
+
+                    when_line = fmt_when_local(m.get("start_time_local"))
+                    prefix = ""
+                    if phase == "double_elim":
+                        br = (m.get("bracket") or "").upper()
+                        prefix = f"({br}) " if br else ""
+                    top = f"{prefix}{a} vs. {b}"
+                    lines.append(top + (f"\n{when_line}" if when_line else ""))
+                next_sections.append(f"**{phase_title(phase)} - round {next_round}**\n" + "\n".join(lines))
+        else:
+            next_sections.append(f"**{phase_title(phase)} - round {next_round}**\n• next round not created yet.")
+
+    # ---- "TOURNAMENT STATUS" (compact, grouped by phase → round)
+    from collections import defaultdict
+    by_phase_round: dict[str, dict[int | None, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for r in all_rows:
+        ph = (r.get("phase") or "unspecified")
+        by_phase_round[ph][r.get("round_no")].append(r)
+
+    status_blocks: list[str] = []
+    for phase in sorted(by_phase_round.keys()):
+        status_lines: list[str] = [f"**{phase_title(phase)}**"]
+        for rn in sorted(by_phase_round[phase].keys(), key=lambda x: (x is None, x if x is not None else 0)):
+            status_lines.append(f"》Round {rn if rn is not None else '-'}")
+            round_matches = sorted(by_phase_round[phase][rn], key=lambda x: x["match_id"])
+            for r in round_matches:
+                a, b = rr_bye_label(phase, r.get("team_a_role_id"), r.get("team_b_role_id"), mention=False)
+                sa, sb = r.get("score_a"), r.get("score_b")
+                score_text = f"{sa}-{sb}" if r.get("reported") and sa is not None and sb is not None else "_ - _"
+                prefix = ""
+                if phase == "double_elim":
+                    br = (r.get("bracket") or "").upper()
+                    if br in ("WB", "LB", "GF"):
+                        prefix = f"({br}) "
+                status_lines.append(f"☆ match #{r['match_id']}:    {prefix}{a} vs {b} ━ score: {score_text}")
+        status_blocks.append("\n".join(status_lines))
+
+    list_text = "\n\n".join(status_blocks) if status_blocks else "No matches yet."
+
+    # ---- compose message
+    divider = "-" * 64
     header_last = ":feet: **MATCHES LAST WEEK!**"
     header_next = ":feet: **MATCHES THIS WEEK!**"
     header_status = ":cat: **TOURNAMENT STATUS**"
@@ -1037,21 +1308,18 @@ async def tournament_announcement(inter: discord.Interaction, slug: str, post: b
         "good luck! <3"
     )
 
-    last_text = "\n".join(last_lines) if last_lines else "• —"
-    next_text = "\n\n".join(next_lines) if next_lines else "• —"
+    chunks: list[str] = [intro, divider]
+    if include_last:
+        chunks.append(header_last)
+        chunks.append("\n\n".join(last_sections))
+        chunks.append(divider)
+    chunks.append(header_next)
+    chunks.append("\n\n".join(next_sections))
+    chunks.append(divider)
+    chunks.append(header_status)
+    chunks.append(list_text)
 
-    msg = (
-        f"{intro}\n\n"
-        f"{divider}\n"
-        f"{header_last}\n\n"
-        f"{last_text}\n\n"
-        f"{divider}\n"
-        f"{header_next}\n\n"
-        f"{next_text}\n\n"
-        f"{divider}\n"
-        f"{header_status}\n\n"
-        f"{list_text}"
-    )
+    msg = "\n\n".join(chunks)
 
     # post or preview
     if post:
@@ -1066,89 +1334,223 @@ async def tournament_announcement(inter: discord.Interaction, slug: str, post: b
         if not isinstance(ch, discord.TextChannel):
             return await inter.response.send_message("configured announcements channel is invalid.", ephemeral=True)
 
-        chunks: list[str] = []
+        # chunk to avoid 2k limit
+        out_chunks: list[str] = []
         cur, cur_len = [], 0
         for line in msg.split("\n"):
             if cur_len + len(line) + 1 > 1900:
-                chunks.append("\n".join(cur))
-                cur, cur_len = [], 0
-            cur.append(line)
-            cur_len += len(line) + 1
+                out_chunks.append("\n".join(cur)); cur, cur_len = [], 0
+            cur.append(line); cur_len += len(line) + 1
         if cur:
-            chunks.append("\n".join(cur))
+            out_chunks.append("\n".join(cur))
 
-        # allow role pings (for "this week" section)
         allow = discord.AllowedMentions(roles=True, users=False, everyone=False)
-        for chunk in chunks:
+        for chunk in out_chunks:
             await ch.send(chunk, allowed_mentions=allow)
-        return await inter.response.send_message("Announcement posted ✅", ephemeral=True)
+        return await inter.response.send_message("announcement posted ✅", ephemeral=False)
     else:
         return await inter.response.send_message(msg, ephemeral=True)
 
 
-# /tournament swiss_refresh
+# /tournament refresh
 @tournament.command(
-    name="swiss_refresh",
-    description="Fill the next Swiss round's placeholders based on current results (does not create matches)."
+    name="refresh",
+    description="Fill the next round's placeholders for Swiss or Double Elim (or both with auto)."
 )
-@app_commands.describe(tournament_id="tournament ID")
-async def tournament_swiss_refresh(inter: discord.Interaction, tournament_id: str):
+@app_commands.describe(
+    tournament_id="tournament ID",
+    kind="Which to refresh: auto/swiss/double_elim"
+)
+async def tournament_refresh(
+    inter: discord.Interaction,
+    tournament_id: str,
+    kind: Literal["auto", "swiss", "double_elim"] = "auto"
+):
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms", ephemeral=True)
     if not get_settings(tournament_id):
         return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first", ephemeral=True)
 
-    # latest fully reported round
-    latest = get_latest_fully_reported_round(tournament_id)
-    if not latest:
-        return await inter.response.send_message(
-            "no fully reported Swiss round found yet. report at least one full round first.",
-            ephemeral=True
-        )
+    results: list[str] = []
 
-    next_round = latest + 1
-    # next round must already exist (placeholders created earlier via /match add)
-    if not round_exists(tournament_id, next_round):
-        return await inter.response.send_message(
-            f"round {next_round} does not exist yet. create placeholders first: `/match add tournament_id:{tournament_id} kind:swiss rounds:1`.",
-            ephemeral=True
-        )
-    if not round_has_placeholders(tournament_id, next_round):
-        return await inter.response.send_message(
-            f"round {next_round} has no empty placeholders to fill (maybe already assigned?).",
-            ephemeral=True
-        )
+    async def do_swiss() -> None:
+        phase = "swiss"
+        latest = get_latest_fully_reported_round(tournament_id, phase)
+        if not latest:
+            results.append("Swiss: no fully-reported round yet.")
+            return
 
-    prev_ms = list_round_matches(tournament_id, latest)
-    team_ids: list[int] = []
-    for m in prev_ms:
-        for t in (m["team_a_role_id"], m["team_b_role_id"]):
-            if t and t not in team_ids:
-                team_ids.append(t)
+        next_round = latest + 1
+        if not round_exists(tournament_id, next_round, phase):
+            results.append(f"Swiss: round {next_round} doesn't exist. Create placeholders with `/match add kind:swiss`.")
+            return
+        if not round_has_placeholders(tournament_id, next_round, phase):
+            results.append(f"Swiss: round {next_round} has no empty placeholders.")
+            return
 
-    hist = swiss_history(tournament_id)
-    pairs = pair_next_round(team_ids, hist)  # returns list[(a,b)]
+        prev_ms = list_round_matches(tournament_id, latest, phase)
+        team_ids: list[int] = []
+        for m in prev_ms:
+            for t in (m.get("team_a_role_id"), m.get("team_b_role_id")):
+                if t and t not in team_ids:
+                    team_ids.append(t)
 
-    placeholders = list_round_placeholders(tournament_id, next_round)
-    if len(pairs) != len(placeholders):
-        return await inter.response.send_message(
-            f"cannot fill round {next_round}: {len(placeholders)} placeholders vs {len(pairs)} computed pairs.",
-            ephemeral=True
-        )
+        # Uses your swiss helper & history (still reads swiss only)
+        hist = swiss_history(tournament_id)
+        pairs = pair_next_round(team_ids, hist)  # -> list[(a,b)]
 
-    try:
-        assign_pairs_into_round(tournament_id, next_round, pairs)
-    except ValueError as e:
-        return await inter.response.send_message(str(e), ephemeral=True)
+        placeholders = list_round_placeholders(tournament_id, next_round, phase)
+        if len(pairs) != len(placeholders):
+            results.append(
+                f"Swiss: can't fill round {next_round}: {len(placeholders)} placeholders vs {len(pairs)} pairs."
+            )
+            return
 
-    lines = []
-    for mid, (a, b) in zip(placeholders, pairs):
-        lines.append(f"• <@&{a}> vs <@&{b}>  (#{mid})")
+        try:
+            assign_pairs_into_round(tournament_id, next_round, pairs, phase)
+        except ValueError as e:
+            results.append(f"Swiss: {e}")
+            return
 
+        lines = [f"• <@&{a}> vs <@&{b}>  (#{mid})" for mid, (a, b) in zip(placeholders, pairs)]
+        results.append(f"Swiss → Round {next_round} filled:\n" + "\n".join(lines))
+
+    async def do_de() -> None:
+        phase = "double_elim"
+
+        latest = get_latest_round(tournament_id, phase)
+        if latest is None or latest == 0:
+            results.append("DE: no rounds exist yet.")
+            return
+
+        next_round = latest + 1
+        if not round_exists(tournament_id, next_round, phase):
+            results.append(f"DE: round {next_round} doesn't exist. Create placeholders with `/match add kind:double_elim`.")
+            return
+        if not round_has_placeholders(tournament_id, next_round, phase):
+            results.append(f"DE: round {next_round} has no empty placeholders.")
+            return
+
+        latest_matches = list_round_matches(tournament_id, latest, phase)
+        if not latest_matches:
+            results.append(f"DE: no matches found for round {latest}.")
+            return
+
+        wb_winners: list[int] = []
+        wb_losers:  list[int] = []
+        lb_winners: list[int] = []
+
+        if n == 6 and latest == 1:
+            # seeds (team_id ascending)
+            rows = list_teams(tournament_id)
+            rows.sort(key=lambda r: int(r["team_id"]))
+            seed1 = int(rows[0]["team_role_id"])
+            seed2 = int(rows[1]["team_role_id"])
+
+            # winners of LCQ (two teams)
+            if len(wb_winners) != 2:
+                results.append("DE: need both LCQ winners reported to seed round 2.")
+                return
+
+            # ensure order: winner of LCQ#1 vs seed1, winner of LCQ#2 vs seed2
+            wb_pairs = [(wb_winners[0], seed1), (wb_winners[1], seed2)]
+            lb_pairs = []  # none in R2 for 6-team template
+
+            # rebuild assign_pairs according to placeholder order
+            nr_matches = list_round_matches(tournament_id, next_round, phase)
+            slots = [r for r in nr_matches if r.get("team_a_role_id") is None and r.get("team_b_role_id") is None]
+            mids_in_order = [int(r["match_id"]) for r in sorted(slots, key=lambda x: x["match_id"])]
+            mid_to_bracket = {int(r["match_id"]): (r.get("bracket") or "").upper() for r in slots}
+
+            q = {"WB": wb_pairs[:], "LB": []}
+            assign_pairs = []
+            for mid in mids_in_order:
+                br = mid_to_bracket.get(mid, "WB")
+                assign_pairs.append(q[br].pop(0) if q.get(br) else (None, None))
+
+        for m in sorted(latest_matches, key=lambda x: x["match_id"]):
+            sa, sb = m.get("score_a"), m.get("score_b")
+            if not (m.get("reported") and sa is not None and sb is not None and sa != sb):
+                continue
+            a, b = m.get("team_a_role_id"), m.get("team_b_role_id")
+            if a is None or b is None:
+                continue
+
+            winner = a if sa > sb else b
+            loser  = b if sa > sb else a
+            bracket = (m.get("bracket") or "").upper()
+
+            if bracket == "LB":
+                lb_winners.append(winner)
+            else:
+                wb_winners.append(winner)
+                wb_losers.append(loser)
+
+        # Figure out NEXT-ROUND placeholder slots by bracket, preserving DB order
+        nr_matches = list_round_matches(tournament_id, next_round, phase)
+        # Only placeholders (both teams NULL)
+        nr_placeholders = [r for r in nr_matches if r.get("team_a_role_id") is None and r.get("team_b_role_id") is None]
+        if not nr_placeholders:
+            results.append(f"DE: round {next_round} has no placeholders after filtering.")
+            return
+
+        mids_in_order = [int(r["match_id"]) for r in sorted(nr_placeholders, key=lambda x: x["match_id"])]
+        mid_to_bracket = {int(r["match_id"]): (r.get("bracket") or "").upper() for r in nr_placeholders}
+
+        # Build WB/LB pairs from queues
+        def to_pairs(seq: list[int]) -> list[tuple[int|None, int|None]]:
+            buf = seq[:]
+            out: list[tuple[int|None, int|None]] = []
+            while len(buf) >= 2:
+                out.append((buf.pop(0), buf.pop(0)))
+            return out
+
+        wb_pairs = to_pairs(wb_winners)
+        lb_pairs = to_pairs(wb_losers + lb_winners)
+
+        def pop_or_pad(br: str) -> tuple[int|None, int|None]:
+            if br == "WB":
+                return wb_pairs.pop(0) if wb_pairs else (None, None)
+            else:
+                return lb_pairs.pop(0) if lb_pairs else (None, None)
+
+        assign_pairs: list[tuple[int|None, int|None]] = []
+        for mid in mids_in_order:
+            br = mid_to_bracket.get(mid, "WB")
+            assign_pairs.append(pop_or_pad(br))
+
+        try:
+            assign_pairs_into_round(tournament_id, next_round, assign_pairs, phase)
+        except ValueError as e:
+            results.append(f"DE: {e}")
+            return
+
+        # pretty output
+        out_lines: list[str] = []
+        for mid, (a, b) in zip(mids_in_order, assign_pairs):
+            la = f"<@&{a}>" if a else "TBD"
+            lb = f"<@&{b}>" if b else "TBD"
+            out_lines.append(f"• {la} vs {lb}  (#{mid})")
+
+        results.append(f"double elim → round {next_round} filled:\n" + "\n".join(out_lines))
+
+    phases = (
+        ["swiss", "double_elim"] if kind == "auto"
+        else [kind]
+    )
+
+    if "swiss" in phases:
+        await do_swiss()
+    if "double_elim" in phases:
+        await do_de()
+
+    # Compose output
+    # If nothing happened, make that clear.
+    body = "\n\n".join(results) if results else "No action taken."
     await inter.response.send_message(
         embed=discord.Embed(
-            title=f"Swiss Round {next_round} filled — {tournament_id}",
-            description="\n".join(lines),
+            title=f"Refresh - {tournament_id} ({kind})",
+            description=body,
             color=0xB54882
         ),
         ephemeral=True
@@ -1226,11 +1628,11 @@ async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> bool:
 
     prefix = "🕑  reminder"
     if kind == "noon":
-        body = f"{prefix}: day-of reminder for **match #{mid}** — starts **{pretty}**."
+        body = f"{prefix}: day-of reminder for **match #{mid}** - starts **{pretty}**."
     elif kind == "pre2h":
-        body = f"{prefix}: **2 hours** until **match #{mid}** — starts **{pretty}**."
+        body = f"{prefix}: **2 hours** until **match #{mid}** - starts **{pretty}**."
     else:
-        body = f"{prefix}: **1 hour** until **match #{mid}** — starts **{pretty}**."
+        body = f"{prefix}: **1 hour** until **match #{mid}** - starts **{pretty}**."
 
     try:
         await thread.send(
