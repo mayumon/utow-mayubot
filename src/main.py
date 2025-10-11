@@ -223,7 +223,6 @@ reminders = app_commands.Group(name="reminders", description="match reminders to
 
 
 # /reminders set [match_id]
-# /reminders set
 @reminders.command(name="set", description="schedule reminders (1h + noon/2h) for a match or all matches")
 @app_commands.describe(tournament_id="tournament ID", match_id="match ID (optional; if omitted, schedules for all matches with times)")
 async def reminders_set(inter: discord.Interaction, tournament_id: str, match_id: int | None = None):
@@ -336,38 +335,41 @@ thread = app_commands.Group(name="thread", description="manage match threads", p
 @thread.command(name="create", description="create a private match thread for the two teams in a match.")
 @app_commands.describe(tournament_id="tournament ID", match_id="match ID")
 async def match_thread(inter: discord.Interaction, tournament_id: str, match_id: int):
+    # ⬇️ ACK within 3s so rate limits won't kill the interaction
+    await inter.response.defer(ephemeral=True)
+
     if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms", ephemeral=True)
+        return await inter.followup.send("need manage server perms", ephemeral=True)
 
     # config checks
     s = get_settings(tournament_id)
     if not s:
-        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+        return await inter.followup.send(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
 
     ch_id = s.get("match_chats_ch")
     if not ch_id:
-        return await inter.response.send_message("match-chats channel not set. run `/setup channels` first.",ephemeral=True)
+        return await inter.followup.send("match-chats channel not set. run `/setup channels` first.", ephemeral=True)
 
     if not inter.guild:
-        return await inter.response.send_message("this command must be used in a server.", ephemeral=True)
+        return await inter.followup.send("this command must be used in a server.", ephemeral=True)
 
     channel = inter.guild.get_channel(ch_id)
     if not isinstance(channel, discord.TextChannel):
-        return await inter.response.send_message("configured match-chats channel is not a text channel.", ephemeral=True)
+        return await inter.followup.send("configured match-chats channel is not a text channel.", ephemeral=True)
 
     m = get_match(tournament_id, match_id)
     if not m:
-        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
+        return await inter.followup.send(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
 
     a_id = m.get("team_a_role_id")
     b_id = m.get("team_b_role_id")
     if not a_id or not b_id:
-        return await inter.response.send_message(f"match `#{match_id}` does not have both teams assigned yet.", ephemeral=True)
+        return await inter.followup.send(f"match `#{match_id}` does not have both teams assigned yet.", ephemeral=True)
 
     a_role = inter.guild.get_role(a_id)
     b_role = inter.guild.get_role(b_id)
     if not a_role or not b_role:
-        return await inter.response.send_message("one or both team roles no longer exist on this server.", ephemeral=True)
+        return await inter.followup.send("one or both team roles no longer exist on this server.", ephemeral=True)
 
     # title
     def _phase_prefix(phase: str, round_no: int | None) -> str:
@@ -382,6 +384,7 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
         if p == "double_elim":
             return f"double elimination {rn}"
         return f"round {rn}"
+
     phase = (m.get("phase") or "").lower()
     round_no = m.get("round_no")
     prefix = _phase_prefix(phase, round_no)
@@ -390,11 +393,16 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
 
     # create thread
     try:
-        thread = await channel.create_thread(name=title, type=discord.ChannelType.private_thread,invitable=True,auto_archive_duration=10080)
+        thread = await channel.create_thread(
+            name=title,
+            type=discord.ChannelType.private_thread,
+            invitable=True,
+            auto_archive_duration=10080,
+        )
     except discord.Forbidden:
-        return await inter.response.send_message("i dont have permission to create private threads in the configured channel.",ephemeral=True)
+        return await inter.followup.send("i dont have permission to create private threads in the configured channel.", ephemeral=True)
     except Exception as e:
-        return await inter.response.send_message(f"failed to create thread: {e}", ephemeral=True)
+        return await inter.followup.send(f"failed to create thread: {e}", ephemeral=True)
 
     # save thread id
     try:
@@ -414,8 +422,7 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
 
     # mention roles
     mention_text = f"{a_role.mention} ✕ {b_role.mention}"
-    body_lines = [mention_text,
-        "use this thread to coordinate your match time!",]
+    body_lines = [mention_text, "use this thread to coordinate your match time!"]
     if when_txt:
         body_lines.append(f"current scheduled time: **{when_txt}**")
 
@@ -433,9 +440,12 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
                 try:
                     await thread.add_user(member)
                     invited += 1
+                    await asyncio.sleep(0.25)
                 except discord.Forbidden:
                     continue
-                except Exception:
+                except discord.HTTPException as e:
+                    if getattr(e, "status", None) == 429:
+                        await asyncio.sleep(4)
                     continue
         except Exception:
             continue
@@ -446,52 +456,91 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
     except Exception:
         pass
 
-    await inter.response.send_message(
-        embed=discord.Embed(title="match thread created",
-            description="\n".join([
-                f"**channel:** {thread.mention}",
+    # final message (not ephemeral)
+    await inter.followup.send(
+        embed=discord.Embed(
+            title="match thread created",
+            description="\n".join([f"**channel:** {thread.mention}",
                 f"**title:** {title}",
                 f"**invited members:** {invited}",]),
-            color=0xB54882),ephemeral=False)
+            color=0xB54882,),ephemeral=False,)
 
-
-# /match poke <match_id> [time|standard] TODO
+# /match poke <tournament_id> <match_id> [time|standard] TODO
 
 # /match settime <tournament_id> <match_id> <YYYY-MM-DD HH:MM>
-@match.command(name="settime", description="set (or update) the scheduled start time for a match.")
-@app_commands.describe(tournament_id="tournament ID", match_id="match ID",when="date/time in 24h format: YYYY-MM-DD HH:MM")
-async def match_settime(inter: discord.Interaction, tournament_id: str, match_id: int, when: str):
-    if not staff_only(inter):
-        return await inter.response.send_message("need manage server perms,", ephemeral=True)
+# /match settime (context-aware)
+@match.command(name="settime", description="set/update the scheduled start time (players in-thread; staff may pass IDs)")
+@app_commands.describe(when="date/time in 24h format: YYYY-MM-DD HH:MM (local to the tournament)",
+                       tournament_id="(staff) tournament ID if not in the match thread",
+                       match_id="(staff) match ID if not in the match thread",)
+async def match_settime(
+    inter: discord.Interaction,
+    when: str,
+    tournament_id: str | None = None,
+    match_id: int | None = None,
+):
+    in_thread = isinstance(inter.channel, discord.Thread)
+    is_staff = staff_only(inter)
 
-    if not get_settings(tournament_id):
-        return await inter.response.send_message(f"`{tournament_id}` not found; run `/setup new` first.", ephemeral=True)
+    if not is_staff:
+        if tournament_id is not None or match_id is not None:
+            return await inter.response.send_message(
+                "players: use this *inside your match thread*:\n"
+                "`/match settime <YYYY-MM-DD HH:MM>`",
+                ephemeral=True,
+            )
+        if not in_thread:
+            return await inter.response.send_message(
+                "use this inside the match thread for your match.", ephemeral=True
+            )
 
-    m = get_match(tournament_id, match_id)
-    if not m:
-        return await inter.response.send_message(f"match `#{match_id}` not found for `{tournament_id}`.", ephemeral=True)
+    m = None
+    slug: str | None = None
+    mid: int | None = None
 
-    # parse time input
+    if in_thread:
+        m = get_match_by_thread(inter.channel.id)
+        if m:
+            slug = m["tournament_name"]
+            mid = int(m["match_id"])
+
+    if (slug is None or mid is None) and is_staff:
+        if tournament_id is None or match_id is None:
+            return await inter.response.send_message(
+                "staff usage outside a match thread:\n"
+                "`/match settime <YYYY-MM-DD HH:MM> <tournament_id> <match_id>`",
+                ephemeral=True,
+            )
+        slug, mid = tournament_id, match_id
+        m = get_match(slug, mid)
+
+    if not m or slug is None or mid is None:
+        return await inter.response.send_message("couldn't resolve which match this is.", ephemeral=True)
+
+    if not is_staff and not user_in_match(inter, m):
+        return await inter.response.send_message(
+            "only members of the two teams (or staff) can set the time for this match.",
+            ephemeral=True,
+        )
+
+    if not get_settings(slug):
+        return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first.", ephemeral=True)
+
     try:
         dt = datetime.strptime(when, "%Y-%m-%d %H:%M")
     except ValueError:
-        return await inter.response.send_message("invalid time. use **YYYY-MM-DD HH:MM** (24h).",ephemeral=True)
+        return await inter.response.send_message("invalid time. use **YYYY-MM-DD HH:MM** (24h).", ephemeral=True)
 
-    # save to db
-    set_match_time(tournament_id, match_id, dt.strftime("%Y-%m-%d %H:%M"))
+    set_match_time(slug, mid, dt.strftime("%Y-%m-%d %H:%M"))
 
-    # regenerate match reminders
     try:
-        scheduled = schedule_match_reminders(tournament_id, match_id)
+        scheduled = schedule_match_reminders(slug, mid)
         scheduled_msg = f"scheduled {scheduled} reminder(s)."
     except Exception as e:
-        scheduled = 0
         scheduled_msg = f"couldn't schedule reminders ({e})."
 
-    # format
     pretty = f"{dt.strftime('%B')} {dt.day}, {dt.strftime('%A')} at {dt.strftime('%I:%M%p').lstrip('0')}"
 
-    # announce in thread (if exists)
     posted_update = False
     mentioned = False
     try:
@@ -501,28 +550,34 @@ async def match_settime(inter: discord.Interaction, tournament_id: str, match_id
         mention_text = f"{a_mention} {b_mention}".strip()
 
         thread_id = m.get("thread_id")
-        if thread_id and inter.guild:
-            thread = inter.guild.get_thread(thread_id)
-            if thread:
-                await thread.send(
-                    f"{mention_text}\n🕑 match date/time updated: **{pretty}**",
-                    allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
-                )
-                posted_update = True
-                mentioned = True
+        t: discord.Thread | None = None
+        if in_thread and isinstance(inter.channel, discord.Thread):
+            t = inter.channel
+        elif thread_id and inter.guild:
+            t = inter.guild.get_thread(thread_id)
+
+        if t:
+            await t.send(
+                f"{mention_text}\n🕑 match date/time updated: **{pretty}**",
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),)
+            posted_update = True
+            mentioned = bool(mention_text)
     except Exception:
         pass
 
     await inter.response.send_message(
         embed=discord.Embed(
             title="match time set",
-            description="\n".join([ f"**match:** #{match_id}",
+            description="\n".join([
+                f"**match:** #{mid}",
                 f"**time:** {pretty}",
                 ("_update posted and teams pinged in thread_" if mentioned else
                  "_update posted in thread (no pings)_" if posted_update else
                  "_no thread to update_"),
-                f"**reminders:** {scheduled_msg}",]),
-            color=0xB54882),ephemeral=True)
+                f"**reminders:** {scheduled_msg}",
+            ]),
+            color=0xB54882,
+        ),ephemeral=True,)
 
 
 # /match setteam <tournament_id> <match_id> <@team_a> <@team_b>
@@ -1540,6 +1595,18 @@ def team_label_map(slug: str,guild: discord.Guild | None,*,plain: bool,) -> dict
         else:
             out[rid] = f"<@&{rid}>"
     return out
+
+
+def user_in_match(inter: discord.Interaction, m: dict) -> bool:
+    member = inter.user if isinstance(inter.user, discord.Member) else None
+    if not member:
+        return False
+    a_id = m.get("team_a_role_id")
+    b_id = m.get("team_b_role_id")
+    if not a_id and not b_id:
+        return False
+    role_ids = {r.id for r in getattr(member, "roles", [])}
+    return (a_id in role_ids) or (b_id in role_ids)
 
 
 def run():

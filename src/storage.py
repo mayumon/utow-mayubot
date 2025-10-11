@@ -540,7 +540,7 @@ def _parse_local(start_time_local: str, tz_str: str) -> datetime:
     return naive.replace(tzinfo=ZoneInfo(tz_str))
 
 
-def schedule_match_reminders(slug: str, match_id: int) -> int:
+def schedule_match_reminders(slug: str, match_id: int, *, force_reset: bool = False) -> int:
     # load match + tz
     with connect() as con:
         cur = con.cursor()
@@ -558,56 +558,72 @@ def schedule_match_reminders(slug: str, match_id: int) -> int:
         tz = s["tz"] if s and s["tz"] else "America/Toronto"
 
     tzinfo = safe_zoneinfo(tz)
+    utc = safe_zoneinfo("UTC")
 
-    # parse local start
+    # parse local start + "now" in the tournament's TZ
     start_local = datetime.strptime(m["start_time_local"], "%Y-%m-%d %H:%M").replace(tzinfo=tzinfo)
-    now_utc = _now_utc_naive()
-    now_local = datetime.utcnow().replace(tzinfo=safe_zoneinfo("UTC")).astimezone(tzinfo)
+    now_local = datetime.utcnow().replace(tzinfo=utc).astimezone(tzinfo)
+
+    # optional hard reset of any prior rows (including ones marked sent=1)
+    if force_reset:
+        with connect() as con:
+            con.execute("""
+                DELETE FROM reminders
+                 WHERE tournament_name=? AND match_id=?
+            """, (slug, match_id))
+
+    # strict: if match already started, nothing to schedule
+    if start_local <= now_local:
+        # ensure nothing lingers if we didn't force_reset
+        with connect() as con:
+            con.execute("""
+                DELETE FROM reminders
+                 WHERE tournament_name=? AND match_id=?
+            """, (slug, match_id))
+        return 0
+
+    # candidate times (all local)
+    noon_local  = start_local.replace(hour=12, minute=0, second=0, microsecond=0)
+    pre2h_local = start_local - timedelta(hours=2)
+    pre1h_local = start_local - timedelta(hours=1)
 
     desired: list[tuple[str, datetime]] = []
 
-    pre1h_local = start_local - timedelta(hours=1)
-    pre1h_utc = pre1h_local.astimezone(safe_zoneinfo("UTC"))
-
-    if start_local.hour < 14:
-        early_kind = "pre2h"
-        early_dt_local = start_local - timedelta(hours=2)
+    # EARLY SLOT:
+    # - If kickoff is 14:00 or later → NOON only if /reminders set is run BEFORE local noon.
+    # - If kickoff is before 14:00 → PRE2H only if run BEFORE local noon AND before the actual pre2h time.
+    if start_local.hour >= 14:
+        if now_local < noon_local:
+            desired.append(("noon", noon_local.astimezone(utc)))
     else:
-        early_kind = "noon"
-        early_dt_local = start_local.replace(hour=12, minute=0)
+        if now_local < noon_local and now_local <= pre2h_local:
+            desired.append(("pre2h", pre2h_local.astimezone(utc)))
 
-        # if noon already passed, try pre2h instead
-        if early_dt_local <= now_local:
-            alt = start_local - timedelta(hours=2)
-            if alt > now_local:
-                early_kind = "pre2h"
-                early_dt_local = alt
-            else:
-                early_kind = None  # drop early reminder entirely
+    # ONE-HOUR SLOT:
+    # - Only if run at least 1 hour before start.
+    if now_local <= pre1h_local:
+        desired.append(("pre1h", pre1h_local.astimezone(utc)))
 
-    if early_kind is not None:
-        desired.append((early_kind, early_dt_local.astimezone(safe_zoneinfo("UTC"))))
-    desired.append(("pre1h", pre1h_utc))
+    # nothing eligible?
+    if not desired:
+        with connect() as con:
+            con.execute("""
+                DELETE FROM reminders
+                 WHERE tournament_name=? AND match_id=?
+            """, (slug, match_id))
+        return 0
 
-    # if pre1h is past, schedule asap
+    # persist (minute precision), no ASAP fallbacks
     fixed: list[tuple[str, datetime]] = []
+    now_utc_naive = _now_utc_naive()
     for kind, when_dt_utc in desired:
-        # store minute precision
         when_dt_utc = when_dt_utc.replace(second=0, microsecond=0)
-        if when_dt_utc.replace(tzinfo=None) <= now_utc:
-            if kind == "pre1h":
-                asap = (datetime.utcnow() + timedelta(minutes=1)).replace(second=0, microsecond=0)
-                fixed.append((kind, asap.replace(tzinfo=None)))
-            else:
-                # drop early reminder if its already past
-                continue
-        else:
+        if when_dt_utc.replace(tzinfo=None) > now_utc_naive:
             fixed.append((kind, when_dt_utc.replace(tzinfo=None)))
 
-    # upsert + reset sent, delete obsolete kinds
     desired_kinds = {k for k, _ in fixed}
     with connect() as con:
-        # delete kinds we no longer want
+        # delete kinds we no longer want (covers non-force cases cleanly)
         if desired_kinds:
             con.execute(f"""
                 DELETE FROM reminders
@@ -618,8 +634,9 @@ def schedule_match_reminders(slug: str, match_id: int) -> int:
                 DELETE FROM reminders
                  WHERE tournament_name=? AND match_id=?
             """, (slug, match_id))
+            return 0
 
-        # upsert wanted kinds, reset sent=0
+        # upsert desired kinds; always reset sent=0 on change
         for kind, when_utc in fixed:
             con.execute("""
                 INSERT INTO reminders(tournament_name, match_id, when_utc, kind, sent)
