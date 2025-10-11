@@ -11,6 +11,9 @@ from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 import asyncio
+import re
+
+SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
 # initialize bot
 intents = discord.Intents.default()
@@ -45,6 +48,19 @@ def staff_only(inter: discord.Interaction) -> bool:
     m = inter.user if isinstance(inter.user, discord.Member) else None
     return bool(m and m.guild_permissions.manage_guild)
 
+
+def valid_ID(s: str) -> bool:
+    return bool(SAFE_SLUG.fullmatch(s))
+
+
+async def ensure_valid_ID(inter: discord.Interaction, slug: str) -> bool:
+    if valid_ID(slug):
+        return True
+    await inter.response.send_message(
+        "invalid tournament ID. use letters/numbers/`-`/`_` (max 32 chars).",
+        ephemeral=True,)
+    return False
+
 # ------------------------ /setup ------------------------
 
 
@@ -57,6 +73,9 @@ setup = app_commands.Group(name="setup", description="configure tournaments")
 async def setup_new(inter: discord.Interaction, tournament_id: str):
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
+    if not await ensure_valid_ID(inter, tournament_id):
+        return
 
     upsert_settings(tournament_id)
     await inter.response.send_message(f"linked ID `{tournament_id}` to a new tournament.", ephemeral=False)
