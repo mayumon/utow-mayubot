@@ -12,6 +12,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 import asyncio
 import re
+from itertools import chain
 
 SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
@@ -60,6 +61,81 @@ async def ensure_valid_ID(inter: discord.Interaction, slug: str) -> bool:
         "invalid tournament ID. use letters/numbers/`-`/`_` (max 32 chars).",
         ephemeral=True,)
     return False
+
+
+class _RateGate:
+    # keep at most ~0.6 invites/sec
+    # prevent 429s when multiple threads are created or many members are invited
+
+    def __init__(self, per_sec: float = 0.8):
+        import asyncio
+        self._lock = asyncio.Lock()
+        self._min_interval = (1.0 / max(per_sec, 0.01)) * 1.2  # ~1.2s per op at 0.8/s
+        self._next_ts = 0.0
+
+    async def wait(self):
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            now = loop.time()
+            if now < self._next_ts:
+                await asyncio.sleep(self._next_ts - now)
+            self._next_ts = loop.time() + self._min_interval
+
+
+INVITE_GATE = _RateGate(per_sec=0.6)
+
+
+async def safe_add_to_thread(thread: discord.Thread, member: discord.Member, *, max_retries: int = 1) -> bool:
+
+    await INVITE_GATE.wait()
+    try:
+        await thread.add_user(member)
+        await asyncio.sleep(0.1)  # tiny yield to avoid tight loops
+        return True
+
+    except discord.HTTPException as e:
+        if getattr(e, "status", None) == 429:
+            retry = float(getattr(e, "retry_after", 5.0))
+            await asyncio.sleep(retry + 0.35)
+            if max_retries > 0:
+                return await safe_add_to_thread(thread, member, max_retries=max_retries - 1)
+            return False
+        return False
+
+    except discord.Forbidden:
+        return False
+
+
+async def _resolve_role_members(guild: discord.Guild, roles: list[discord.Role]) -> list[discord.Member]:
+    # 1) try cache first
+    cached = {m for r in roles for m in getattr(r, "members", [])}
+    if cached:
+        return list({m.id: m for m in cached}.values())
+
+    # 2) warm the cache for small/medium guilds
+    try:
+        if getattr(guild, "member_count", 0) <= 5000:
+            async for _ in guild.fetch_members(limit=None):
+                pass
+    except Exception:
+        pass
+
+    cached = {m for r in roles for m in getattr(r, "members", [])}
+    if cached:
+        return list({m.id: m for m in cached}.values())
+
+    # 3) hard fallback: stream and filter by role ids
+    role_ids = {r.id for r in roles}
+    filtered: dict[int, discord.Member] = {}
+    try:
+        async for m in guild.fetch_members(limit=None):
+            mids = {rr.id for rr in getattr(m, "roles", [])}
+            if mids & role_ids:
+                filtered[m.id] = m
+    except Exception:
+        pass
+    return list(filtered.values())
+
 
 # ------------------------ /setup ------------------------
 
@@ -452,22 +528,35 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
         pass
 
     # invite role members
+    members = await _resolve_role_members(inter.guild, [a_role, b_role])
+
+    # diagnostics to your logger
+    try:
+        log.info(
+            f"[thread.create] role member counts -- "
+            f"{a_role.name}:{len(getattr(a_role, 'members', []))} "
+            f"{b_role.name}:{len(getattr(b_role, 'members', []))} | "
+            f"resolved total:{len(members)}"
+        )
+    except Exception:
+        pass
+
     invited = 0
-    for role in (a_role, b_role):
-        try:
-            for member in role.members:
-                try:
-                    await thread.add_user(member)
-                    invited += 1
-                    await asyncio.sleep(0.25)
-                except discord.Forbidden:
-                    continue
-                except discord.HTTPException as e:
-                    if getattr(e, "status", None) == 429:
-                        await asyncio.sleep(4)
-                    continue
-        except Exception:
-            continue
+    failures = 0
+
+    BATCH_SIZE = 15
+    BATCH_PAUSE_SEC = 8.0
+
+    for i, member in enumerate(members, 1):
+        ok = await safe_add_to_thread(thread, member)
+        if ok:
+            invited += 1
+        else:
+            failures += 1
+
+        # soft batch pause every N users to avoid hitting discord edge limits
+        if i % BATCH_SIZE == 0 and i < len(members):
+            await asyncio.sleep(BATCH_PAUSE_SEC)
 
     no_pings = discord.AllowedMentions(everyone=False, users=False, roles=False)
     try:
