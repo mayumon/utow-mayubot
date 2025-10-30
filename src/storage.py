@@ -1,6 +1,7 @@
 # storage.py
 # -- small SQLite DB to keep intramural settings
 
+import os
 import sqlite3
 import json
 from contextlib import contextmanager
@@ -8,8 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from datetime import datetime, timedelta
+from .config import DB_PATH
 
-DB_PATH = "utow.db"
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;

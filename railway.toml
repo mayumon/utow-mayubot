@@ -1,0 +1,9 @@
+# railway.toml
+[build]
+builder = "NIXPACKS"  # auto-detects Python from requirements.txt
+
+[deploy]
+startCommand = "python -m src.main"
+
+# auto-deploy
+restartPolicyType = "ON_FAILURE"

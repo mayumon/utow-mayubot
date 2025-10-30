@@ -36,3 +36,16 @@ run py -m src.main on terminal OR Start-Job { py -m src.main } on windows termin
 - `/tournament standings <tournament_id> [all|swiss|roundrobin|double_elim]` – show current rankings.
 - `/tournament announcement <tournament_id> <post:true|false>` - weekly recap/preview (post to channel or preview).
 - `/tournament refresh <tournament_id> [auto|swiss|double_elim]` - fill next round placeholders from results (for swiss and double elimination only).
+
+
+
+
+
+### coming soon:
+
+- fix /tournament standings (error somewhere)
+- hosting
+- add a team list or smth 
+- bye teams bug???
+- add some sort of log idk? if i can like of people using commands and making changes
+- faciltiate weekly announcement + thread w one command
