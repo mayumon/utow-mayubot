@@ -835,3 +835,55 @@ def get_match_by_thread(thread_id: int) -> Optional[dict[str, Any]]:
         """, (thread_id,))
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+# ------------ destructive helpers ------------
+
+def delete_all_matches(tournament_name: str) -> int:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM matches WHERE tournament_name=?",
+            (tournament_name,)
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_all_reminders(tournament_name: str) -> int:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM reminders WHERE tournament_name=?",
+            (tournament_name,)
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_match(tournament_name: str, match_id: int) -> int:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM matches WHERE tournament_name=? AND match_id=?",
+            (tournament_name, match_id)
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_round(tournament_name: str, phase: str, round_no: int) -> int:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM matches WHERE tournament_name=? AND phase=? AND round_no=?",
+            (tournament_name, phase, round_no)
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_phase(tournament_name: str, phase: str) -> int:
+    with connect() as con:
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM matches WHERE tournament_name=? AND phase=?",
+            (tournament_name, phase)
+        )
+        return int(cur.rowcount or 0)

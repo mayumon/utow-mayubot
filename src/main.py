@@ -1581,6 +1581,110 @@ async def tournament_refresh(inter: discord.Interaction, tournament_id: str,kind
         ephemeral=True
     )
 
+
+# /tournament wipe_matches <slug> [delete_threads] [confirm]
+@tournament.command(
+    name="wipe_matches",
+    description="⚠️ delete ALL matches (and reminders) for a tournament. optional: delete created match threads."
+)
+@app_commands.describe(
+    slug="tournament slug",
+    delete_threads="also delete existing match threads (default: false)",
+    confirm="type true to confirm action"
+)
+async def tournament_wipe_matches(
+    inter: discord.Interaction,
+    slug: str,
+    delete_threads: bool = False,
+    confirm: bool = False
+):
+    # perms + existence checks
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+    if not get_settings(slug):
+        return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first.", ephemeral=True)
+
+    if not confirm:
+        return await inter.response.send_message(
+            "⚠️ this will permanently delete **all matches** and **all reminders** for this tournament.\n"
+            "if you're sure, re-run with `confirm: true`.\n"
+            "optionally pass `delete_threads: true` to also delete any created match threads.",
+            ephemeral=True
+        )
+
+    # gather threads
+    all_rows = list_all_matches_full(slug) or []
+    thread_ids = [int(r["thread_id"]) for r in all_rows if r.get("thread_id")]
+
+    deleted_threads = 0
+    failed_threads = 0
+
+    if delete_threads and inter.guild:
+        for tid in thread_ids:
+            try:
+                ch = inter.guild.get_channel(tid) or await inter.guild.fetch_channel(tid)
+                if isinstance(ch, discord.Thread):
+                    try:
+                        await ch.delete(reason=f"[{slug}] tournament wipe")
+                        deleted_threads += 1
+                    except discord.Forbidden:
+                        failed_threads += 1
+                    except Exception:
+                        failed_threads += 1
+            except discord.NotFound:
+                pass
+            except discord.Forbidden:
+                failed_threads += 1
+            except Exception:
+                failed_threads += 1
+
+    # storage layer cleanup
+    try:
+        rem_count = delete_all_reminders(slug)
+    except NameError:
+        rem_count = 0
+    except Exception as e:
+        rem_count = 0
+
+    try:
+        match_count = delete_all_matches(slug)
+    except NameError:
+        # fallback: if storage function isn't added yet, remove rows one by one
+        match_ids = [int(r["match_id"]) for r in all_rows]
+        match_count = 0
+        for mid in match_ids:
+            try:
+                # TODO: per-match delete, delete_match(slug, mid)
+                pass
+            except Exception:
+                pass
+    except Exception:
+        match_count = 0
+
+    # response
+    desc_lines = [
+        f"**tournament:** `{slug}`",
+        f"**matches deleted:** {match_count}",
+        f"**reminders deleted:** {rem_count}",
+    ]
+    if delete_threads:
+        desc_lines.append(f"**threads deleted:** {deleted_threads}")
+        if failed_threads:
+            desc_lines.append(f"**threads failed:** {failed_threads} (missing perms or already deleted)")
+    else:
+        if thread_ids:
+            desc_lines.append(f"_note:_ {len(thread_ids)} match thread(s) exist and kept (pass `delete_threads:true` to remove).")
+
+    await inter.response.send_message(
+        embed=discord.Embed(
+            title="Wipe complete" if match_count or rem_count or deleted_threads else "No changes made",
+            description="\n".join(desc_lines),
+            color=0xB54882
+        ),
+        ephemeral=False
+    )
+
+
 bot.tree.add_command(tournament)
 
 
