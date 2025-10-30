@@ -1821,6 +1821,57 @@ def user_in_match(inter: discord.Interaction, m: dict) -> bool:
     return (a_id in role_ids) or (b_id in role_ids)
 
 
+admin = app_commands.Group(name="admin", description="admin-only utilities")
+
+
+@admin.command(name="import_db", description="(staff) replace /data/utow.db with an uploaded SQLite file")
+@app_commands.describe(file="Attach utow.db (SQLite). Max ~25MB)")
+async def admin_import_db(inter: discord.Interaction, file: discord.Attachment):
+    # perms
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
+    # basic checks
+    if not file.filename.lower().endswith(".db"):
+        return await inter.response.send_message("please upload a .db file.", ephemeral=True)
+    if file.size and file.size > 25 * 1024 * 1024:
+        return await inter.response.send_message("file too large (>25MB).", ephemeral=True)
+
+    await inter.response.defer(ephemeral=True)
+
+    # paths
+    os.makedirs("/data", exist_ok=True)
+    target = "/data/utow.db"
+    backup = "/data/utow.db.bak"
+
+    # Backup existing
+    try:
+        if os.path.exists(target):
+            shutil.copy2(target, backup)
+    except Exception as e:
+        return await inter.followup.send(f"failed to backup existing DB: {e}", ephemeral=True)
+
+    # download to a temp and move atomically
+    tmp = "/data/.upload.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            buf = await file.read()        # reads the attachment bytes
+            f.write(buf)
+        os.replace(tmp, target)
+    except Exception as e:
+        return await inter.followup.send(f"failed to write DB: {e}", ephemeral=True)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+    await inter.followup.send("✅ database imported to `/data/utow.db` (backup at `/data/utow.db.bak`).", ephemeral=True)
+
+bot.tree.add_command(admin)
+
+
 def run():
     logging.basicConfig(level=logging.INFO)
     bot.run(DISCORD_TOKEN)
