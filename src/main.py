@@ -4,6 +4,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from .config import DISCORD_TOKEN
 from .storage import *
+from .storage import compute_standings as db_compute_standings
 from .swiss_helpers import *
 from collections import defaultdict
 import random
@@ -178,7 +179,6 @@ team = app_commands.Group(name="team", description="map/manage teams", parent=se
 
 
 # /setup team add <@role>
-# /setup team add
 @team.command(name="add", description="map a discord team role (auto-assigns team id)")
 @app_commands.describe(tournament_id="tournament ID", role="discord team role")
 async def setup_team_add(inter: discord.Interaction, tournament_id: str, role: discord.Role):
@@ -206,7 +206,6 @@ async def setup_team_add(inter: discord.Interaction, tournament_id: str, role: d
 
 
 # /setup team remove [@role] [challonge-team-id]
-# /setup team remove
 @team.command(name="remove", description="unmap a team by Discord role or team ID")
 @app_commands.describe(tournament_id="tournament ID", role="discord team role (optional)", team_id="team ID (optional)")
 async def setup_team_remove(inter: discord.Interaction, tournament_id: str, role: discord.Role | None = None, team_id: int | None = None):
@@ -576,8 +575,7 @@ async def match_thread(inter: discord.Interaction, tournament_id: str, match_id:
 
 # /match poke <tournament_id> <match_id> [time|standard] TODO
 
-# /match settime <tournament_id> <match_id> <YYYY-MM-DD HH:MM>
-# /match settime (context-aware)
+# /match settime [tournament_id] [match_id] <YYYY-MM-DD HH:MM>
 @match.command(name="settime", description="set/update the scheduled start time (players in-thread; staff may pass IDs)")
 @app_commands.describe(when="date/time in 24h format: YYYY-MM-DD HH:MM (local to the tournament)",
                        tournament_id="(staff) tournament ID if not in the match thread",
@@ -1175,7 +1173,7 @@ async def tournament_rankings(inter: discord.Interaction, slug: str,scope: Liter
         return await inter.response.send_message(f"`{slug}` not found; run `/setup new` first.", ephemeral=True)
 
     phase = None if scope == "all" else scope
-    rows = compute_standings(slug, phase=phase)
+    rows = db_compute_standings(slug, phase=phase)
     if not rows:
         return await inter.response.send_message("no reported matches yet.", ephemeral=True)
 
