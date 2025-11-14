@@ -1185,7 +1185,7 @@ async def tournament_rankings(inter: discord.Interaction, slug: str,scope: Liter
         w, d, l = r["wins"], r["draws"], r["losses"]
         mw, ml, md = r["map_wins"], r["map_losses"], r["md"]
         draw_txt = f" (D:{d})" if d else ""
-        lines.append(f"**☆ {i}. {name}** - match: {w}-{l}{draw_txt} || maps: {mw}-{ml} (map-diff:{md:+})")
+        lines.append(f"**☆ {i}. {name}** - match: {w}-{l}{draw_txt} | maps: {mw}-{ml} (map-diff:{md:+})")
 
     title_scope = "all phases" if phase is None else scope.replace("_", " ")
     embed = discord.Embed(title=f"rankings - {slug} ({title_scope})",
