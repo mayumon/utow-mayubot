@@ -96,7 +96,7 @@ class TeamIdInUseError(Exception):
 
 @contextmanager
 def connect():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30)
     try:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
