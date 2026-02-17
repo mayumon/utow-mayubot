@@ -1,3 +1,5 @@
+# main.py
+
 import logging
 import discord
 from discord import app_commands
@@ -15,6 +17,9 @@ import asyncio
 import re
 from itertools import chain
 import shutil
+import os
+import sqlite3
+from .config import DB_PATH
 
 SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
@@ -25,19 +30,26 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 log = logging.getLogger("reminders")
+_READY_ONCE = False
 
 
 @bot.event
 async def on_ready():
-    print(f"✅ logged in as {bot.user} (ID: {bot.user.id})")
+    global _READY_ONCE
+    if _READY_ONCE:
+        return
+    _READY_ONCE = True
+
+    init_db()
+
     try:
-        init_db()
         synced = await bot.tree.sync()
         print(f"✅ synced {len(synced)} command(s)")
     except Exception as e:
         print(f"❌ sync failed: {e}")
 
     asyncio.create_task(reminder_worker(bot))
+
 
 
 # ------------------------ diagnostics ------------------------
@@ -1695,7 +1707,12 @@ async def _post_reminder_to_thread(bot: commands.Bot, payload: dict) -> tuple[bo
     slug = payload["tournament_name"]
     mid = int(payload["match_id"])
     kind = payload["kind"]
-    thread_id = payload.get("thread_id")
+    thread_id_raw = payload.get("thread_id")
+
+    try:
+        thread_id = int(thread_id_raw) if thread_id_raw is not None else None
+    except (TypeError, ValueError):
+        thread_id = None
 
     # load settings + match
     s = get_settings(slug)
@@ -1821,44 +1838,128 @@ def user_in_match(inter: discord.Interaction, m: dict) -> bool:
 
 
 admin = app_commands.Group(name="admin", description="admin-only utilities")
+def _db_dir() -> str:
+    d = os.path.dirname(DB_PATH)
+    return d if d else "."
+
+def _db_base() -> str:
+    # /data/utow.db -> utow.db
+    return os.path.basename(DB_PATH) or "utow.db"
+
+def _db_wal() -> str:
+    return DB_PATH + "-wal"
+
+def _db_shm() -> str:
+    return DB_PATH + "-shm"
+
+def _is_sqlite_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+        return head.startswith(b"SQLite format 3")
+    except Exception:
+        return False
+
+def _checkpoint(path: str) -> tuple[bool, str]:
+    try:
+        con = sqlite3.connect(path, timeout=5)
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            con.close()
+        return True, "checkpoint: OK (TRUNCATE)"
+    except Exception as e:
+        return False, f"checkpoint: FAILED ({e})"
 
 
-@admin.command(name="import_db", description="(staff) replace /data/utow.db with an uploaded SQLite file")
-@app_commands.describe(file="Attach utow.db (SQLite). Max ~25MB)")
-async def admin_import_db(inter: discord.Interaction, file: discord.Attachment):
-    # perms
+@admin.command(name="export_db", description="(staff) download the current SQLite DB")
+async def admin_export_db(inter: discord.Interaction):
     if not staff_only(inter):
         return await inter.response.send_message("need manage server perms.", ephemeral=True)
 
-    # basic checks
+    await inter.response.defer(ephemeral=True)
+
+    path = DB_PATH
+    if not os.path.exists(path):
+        return await inter.followup.send(f"no DB found at DB_PATH (`{path}`)", ephemeral=True)
+
+    # checkpoint so the exported file is as up-to-date as possible
+    ok, note = _checkpoint(path)
+
+    try:
+        await inter.followup.send(
+            content=f"✅ here is the current database.\n{note if ok else note}",
+            file=discord.File(path, filename=_db_base()),
+            ephemeral=True
+        )
+    except Exception as e:
+        await inter.followup.send(f"failed to send DB: {e}", ephemeral=True)
+
+
+@admin.command(name="import_db", description="(staff) replace DB_PATH with an uploaded SQLite file")
+@app_commands.describe(file="Attach a .db (SQLite). Max ~25MB")
+async def admin_import_db(inter: discord.Interaction, file: discord.Attachment):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
     if not file.filename.lower().endswith(".db"):
-        return await inter.response.send_message("please upload a .db file.", ephemeral=True)
+        return await inter.response.send_message("please upload a `.db` file.", ephemeral=True)
     if file.size and file.size > 25 * 1024 * 1024:
         return await inter.response.send_message("file too large (>25MB).", ephemeral=True)
 
     await inter.response.defer(ephemeral=True)
 
-    # paths
-    os.makedirs("/data", exist_ok=True)
-    target = "/data/utow.db"
-    backup = "/data/utow.db.bak"
+    dbdir = _db_dir()
+    os.makedirs(dbdir, exist_ok=True)
 
-    # Backup existing
+    target = DB_PATH
+    backup = os.path.join(dbdir, _db_base() + ".bak")
+    tmp = os.path.join(dbdir, ".upload.tmp")
+
+    notes: list[str] = []
+
+    # checkpoint current DB if it exists
+    if os.path.exists(target):
+        ok, note = _checkpoint(target)
+        notes.append(note)
+
+    # backup existing DB (and optionally its wal/shm)
     try:
         if os.path.exists(target):
             shutil.copy2(target, backup)
+            notes.append(f"backup: OK → `{backup}`")
+            # these files are optional; if they exist, keep them with the backup name too
+            if os.path.exists(_db_wal()):
+                shutil.copy2(_db_wal(), backup + "-wal")
+            if os.path.exists(_db_shm()):
+                shutil.copy2(_db_shm(), backup + "-shm")
     except Exception as e:
         return await inter.followup.send(f"failed to backup existing DB: {e}", ephemeral=True)
 
-    # download to a temp and move atomically
-    tmp = "/data/.upload.tmp"
+    # download upload to temp
     try:
+        buf = await file.read()
         with open(tmp, "wb") as f:
-            buf = await file.read()        # reads the attachment bytes
             f.write(buf)
-        os.replace(tmp, target)
+        notes.append("upload: downloaded")
     except Exception as e:
-        return await inter.followup.send(f"failed to write DB: {e}", ephemeral=True)
+        return await inter.followup.send(f"failed to download/write upload: {e}", ephemeral=True)
+
+    # validate sqlite header
+    if not _is_sqlite_file(tmp):
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return await inter.followup.send("that file is not a valid SQLite database.", ephemeral=True)
+
+    # swap atomically
+    try:
+        os.replace(tmp, target)
+        notes.append("swap: OK")
+    except Exception as e:
+        return await inter.followup.send(f"failed to replace DB: {e}", ephemeral=True)
     finally:
         try:
             if os.path.exists(tmp):
@@ -1866,7 +1967,71 @@ async def admin_import_db(inter: discord.Interaction, file: discord.Attachment):
         except Exception:
             pass
 
-    await inter.followup.send("✅ database imported to `/data/utow.db` (backup at `/data/utow.db.bak`).", ephemeral=True)
+    # after swap, remove stale WAL/SHM from *old* DB (new DB will recreate as needed)
+    try:
+        if os.path.exists(_db_wal()):
+            os.remove(_db_wal())
+            notes.append("removed: stale -wal")
+        if os.path.exists(_db_shm()):
+            os.remove(_db_shm())
+            notes.append("removed: stale -shm")
+    except Exception as e:
+        notes.append(f"remove wal/shm: FAILED ({e})")
+
+    await inter.followup.send(
+        "✅ imported DB.\n" + "\n".join(f"• {x}" for x in notes) + "\n\n**Restart the service now**.",
+        ephemeral=True
+    )
+
+
+@admin.command(name="repair_db", description="(staff) attempt to unstick SQLite (checkpoint WAL + clear stale lock files)")
+async def admin_repair_db(inter: discord.Interaction):
+    if not staff_only(inter):
+        return await inter.response.send_message("need manage server perms.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=True)
+
+    path = DB_PATH
+    if not os.path.exists(path):
+        return await inter.followup.send(f"no DB found at DB_PATH (`{path}`)", ephemeral=True)
+
+    wal = _db_wal()
+    shm = _db_shm()
+
+    notes: list[str] = []
+
+    ok, note = _checkpoint(path)
+    notes.append(note)
+
+    # if checkpoint failed, try clearing WAL/SHM
+    if not ok:
+        try:
+            if os.path.exists(wal):
+                os.remove(wal)
+                notes.append(f"removed: {os.path.basename(wal)}")
+            if os.path.exists(shm):
+                os.remove(shm)
+                notes.append(f"removed: {os.path.basename(shm)}")
+        except Exception as e:
+            notes.append(f"remove wal/shm: FAILED ({e})")
+
+    # integrity check
+    try:
+        con = sqlite3.connect(path, timeout=5)
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+            row = con.execute("PRAGMA integrity_check").fetchone()
+            notes.append(f"integrity_check: {row[0] if row else 'unknown'}")
+        finally:
+            con.close()
+    except Exception as e:
+        notes.append(f"integrity_check: FAILED ({e})")
+
+    await inter.followup.send(
+        "✅ repair attempt finished:\n" + "\n".join(f"• {x}" for x in notes) +
+        "\n\nIf it’s still broken: **restart the service**.",
+        ephemeral=True
+    )
 
 bot.tree.add_command(admin)
 

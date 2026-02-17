@@ -11,8 +11,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from datetime import datetime, timedelta
 from .config import DB_PATH
 
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+_dbdir = os.path.dirname(DB_PATH) or "."
+os.makedirs(_dbdir, exist_ok=True)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -100,6 +100,9 @@ def connect():
     try:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA busy_timeout=5000")
         yield con
         con.commit()
     except:
